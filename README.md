@@ -4,7 +4,7 @@ Gallery++ is a community fork of SillyTavern's Gallery extension. It keeps the n
 
 ## Install directly from GitHub
 
-Gallery++ is structured as a SillyTavern third-party extension repository. The extension manifest is kept at the repository root so SillyTavern can install it from the repository URL.
+Gallery++ is structured as a SillyTavern third-party extension repository. The extension manifest is kept at the repository root so SillyTavern can install it from the repository URL. The code uses third-party-safe core import paths and resolves bundled assets from its own installed URL, so the repository folder name does not matter.
 
 1. In SillyTavern, open **Extensions** → **Install Extension**.
 2. Paste:
@@ -24,16 +24,16 @@ Gallery++ uses the Gallery UI IDs and slash commands from the original extension
 The repository contents can also be placed directly in either of these locations:
 
 ```text
-SillyTavern/data/<your-user>/extensions/gallery-plus-plus/
+SillyTavern/data/<your-user>/extensions/<extension-folder>/
 ```
 
 or, for a global installation:
 
 ```text
-SillyTavern/public/scripts/extensions/third-party/gallery-plus-plus/
+SillyTavern/public/scripts/extensions/third-party/<extension-folder>/
 ```
 
-`manifest.json` and `index.js` must be directly inside the `gallery-plus-plus` directory.
+`manifest.json` and `index.js` must be directly inside the extension directory created by SillyTavern.
 
 ## Keyboard shortcuts
 
@@ -86,6 +86,10 @@ Compared with the vanilla SillyTavern Gallery 1.5.0:
 - Added a visible **error notification when gallery loading fails**.
 - Removed minor redundant CSS/code.
 - Renamed the fork to **Gallery++**.
+
+## Packaging/runtime compatibility fix
+
+Gallery++ is installed as a third-party extension, not as SillyTavern's built-in `scripts/extensions/gallery/` extension. The fork therefore uses the correct relative import depth for the third-party mount and resolves its bundled nanogallery2 files relative to `index.js` itself. This prevents the extension loader from hitting broken module/asset URLs after a Git repository install.
 
 ## Compatibility
 

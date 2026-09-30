@@ -10,20 +10,20 @@ import {
     event_types,
     animation_duration,
     animation_easing,
-} from '../../../script.js';
-import { groups, selected_group } from '../../group-chats.js';
-import { loadFileToDocument, getBase64Async, getSanitizedFilename, saveBase64AsFile, getFileExtension, getVideoThumbnail, clamp } from '../../utils.js';
-import { power_user } from '../../power-user.js';
-import { dragElement } from '../../RossAscends-mods.js';
-import { SlashCommandParser } from '../../slash-commands/SlashCommandParser.js';
-import { SlashCommand } from '../../slash-commands/SlashCommand.js';
-import { ARGUMENT_TYPE, SlashCommandNamedArgument } from '../../slash-commands/SlashCommandArgument.js';
-import { DragAndDropHandler } from '../../dragdrop.js';
-import { commonEnumProviders } from '../../slash-commands/SlashCommandCommonEnumsProvider.js';
-import { t, translate } from '../../i18n.js';
-import { Popup } from '../../popup.js';
-import { deleteMediaFromServer } from '../../chats.js';
-import { MEDIA_REQUEST_TYPE, VIDEO_EXTENSIONS } from '../../constants.js';
+} from '../../../../script.js';
+import { groups, selected_group } from '../../../group-chats.js';
+import { loadFileToDocument, getBase64Async, getSanitizedFilename, saveBase64AsFile, getFileExtension, getVideoThumbnail, clamp } from '../../../utils.js';
+import { power_user } from '../../../power-user.js';
+import { dragElement } from '../../../RossAscends-mods.js';
+import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
+import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
+import { ARGUMENT_TYPE, SlashCommandNamedArgument } from '../../../slash-commands/SlashCommandArgument.js';
+import { DragAndDropHandler } from '../../../dragdrop.js';
+import { commonEnumProviders } from '../../../slash-commands/SlashCommandCommonEnumsProvider.js';
+import { t, translate } from '../../../i18n.js';
+import { Popup } from '../../../popup.js';
+import { deleteMediaFromServer } from '../../../chats.js';
+import { MEDIA_REQUEST_TYPE, VIDEO_EXTENSIONS } from '../../../constants.js';
 
 const isVideo = (/** @type {string} */ url) => {
     const lowerUrl = String(url).toLowerCase();
@@ -32,8 +32,11 @@ const isVideo = (/** @type {string} */ url) => {
         return lowerUrl.endsWith(normalizedExt.startsWith('.') ? normalizedExt : `.${normalizedExt}`);
     });
 };
-const extensionName = 'gallery-plus-plus';
-const extensionFolderPath = `scripts/extensions/third-party/${extensionName}/`;
+// Resolve bundled assets from the actual installed extension URL.
+// This works for both user-scoped and all-users third-party installs, regardless
+// of the repository/folder name SillyTavern chooses for the clone.
+const extensionBaseUrl = new URL('.', import.meta.url);
+const getExtensionAssetUrl = (fileName) => new URL(fileName, extensionBaseUrl).href;
 let firstTime = true;
 let deleteModeActive = false;
 let galleryRequestToken = 0;
@@ -619,11 +622,11 @@ async function showCharGallery(deleteModeState = false) {
     // Load necessary files if it's the first time calling the function
     if (firstTime) {
         await loadFileToDocument(
-            `${extensionFolderPath}nanogallery2.woff.min.css`,
+            getExtensionAssetUrl('nanogallery2.woff.min.css'),
             'css',
         );
         await loadFileToDocument(
-            `${extensionFolderPath}jquery.nanogallery2.min.js`,
+            getExtensionAssetUrl('jquery.nanogallery2.min.js'),
             'js',
         );
         firstTime = false;

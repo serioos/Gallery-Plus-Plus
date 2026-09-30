@@ -27,3 +27,8 @@ These are the differences with the vanilla 1.5.0 Gallery extension of SillyTaver
 * Added a visible **error notification when gallery loading fails**.
 * Removed minor redundant CSS/code.
 * Renamed the fork to **Gallery++**.
+
+### Packaging fix (same v1.5.0 feature set)
+
+* Corrected the relative import paths for third-party SillyTavern installation.
+* Resolved bundled nanogallery2 assets relative to the installed extension URL instead of assuming a particular folder name.
