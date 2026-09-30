@@ -1,0 +1,112 @@
+/* Keep the gallery contained inside the usable viewport. The extension also
+   limits nanogallery2 to a safe number of rows so portrait-heavy pages never
+   push the panel underneath the browser/taskbar. */
+#galleryPlusPlus {
+    max-height: calc(100dvh - 4px);
+    box-sizing: border-box;
+    overflow: hidden !important;
+}
+
+#galleryPlusPlus #dragGalleryPlusPlus {
+    max-height: calc(82dvh - 180px);
+    overflow: hidden;
+}
+
+#galleryPlusPlus .nGY2 {
+    max-width: 100%;
+    max-height: 100%;
+    overflow: hidden;
+}
+
+#galleryPlusPlus .nGY2GalleryBottom {
+    display: none !important;
+}
+
+#galleryPlusPlus .gallery-page-button {
+    width: 2.25em;
+    min-width: 2.25em;
+    height: 2.25em;
+    min-height: 2.25em;
+    padding: 0;
+    margin-left: 4px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+}
+
+#galleryPlusPlus .gallery-page-button i {
+    margin: 0;
+    font-size: 0.9em;
+}
+
+.gallery-folder-input {
+    background-color: transparent;
+    font-size: calc(var(--mainFontSize)* 0.9);
+    opacity: 0.8;
+    flex-grow: 1;
+}
+
+.gallery-folder-input:placeholder-shown {
+    font-style: italic;
+    opacity: 0.5;
+    border-color: transparent;
+}
+
+.gallery-sort-select {
+    width: 100%;
+    flex: 1;
+    cursor: pointer;
+    overflow-x: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    opacity: 0.8;
+    background-color: var(--black30a);
+    border: 1px solid var(--SmartThemeBorderColor);
+    background-image: url(/img/down-arrow.svg);
+    background-repeat: no-repeat;
+    background-position: right 6px center;
+    background-size: 8px 5px;
+    padding-right: 20px;
+    margin-bottom: 0;
+}
+
+#galleryPlusPlus .dragTitle {
+    margin-right: 30px;
+}
+
+#dragGalleryPlusPlus {
+    min-height: 25dvh;
+}
+
+#galleryPlusPlus .right_menu_button.warning {
+    opacity: 1;
+    filter: unset;
+}
+
+.galleryPlusPlusImageDraggable video {
+    width: 100%;
+}
+
+/* The gallery stays just above the background but behind other SillyTavern UI.
+   This intentionally overrides #movingDivs > div's default high stacking level. */
+#movingDivs > #galleryPlusPlus,
+#movingDivs > .galleryPlusPlusImageDraggable {
+    z-index: 1 !important;
+}
+
+.gallery-side-toggle {
+    width: 2.25em;
+    min-width: 2.25em;
+    padding-left: 0;
+    padding-right: 0;
+    margin-left: 4px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.gallery-side-toggle.toggled {
+    border-color: var(--active);
+}
+

@@ -1,0 +1,16 @@
+{
+    "display_name": "Gallery++",
+    "loading_order": 6,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "City-Unit / Gallery++ community fork",
+    "version": "1.0.0",
+    "auto_update": true,
+    "minimum_client_version": "1.17.0",
+    "description": "A community fork of SillyTavern's Gallery with fixed left/right click image placement and improved third-party installation support.",
+    "hooks": {
+        "activate": "init"
+    }
+}
