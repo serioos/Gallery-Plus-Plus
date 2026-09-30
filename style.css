@@ -1,28 +1,31 @@
+/* Gallery++ Version 1.5.0 — modified from SillyTavern's Gallery extension.
+ * SPDX-License-Identifier: AGPL-3.0-or-later */
+
 /* Keep the gallery contained inside the usable viewport. The extension also
    limits nanogallery2 to a safe number of rows so portrait-heavy pages never
    push the panel underneath the browser/taskbar. */
-#galleryPlusPlus {
+#gallery {
     max-height: calc(100dvh - 4px);
     box-sizing: border-box;
     overflow: hidden !important;
 }
 
-#galleryPlusPlus #dragGalleryPlusPlus {
+#gallery #dragGallery {
     max-height: calc(82dvh - 180px);
     overflow: hidden;
 }
 
-#galleryPlusPlus .nGY2 {
+#gallery .nGY2 {
     max-width: 100%;
     max-height: 100%;
     overflow: hidden;
 }
 
-#galleryPlusPlus .nGY2GalleryBottom {
+#gallery .nGY2GalleryBottom {
     display: none !important;
 }
 
-#galleryPlusPlus .gallery-page-button {
+#gallery .gallery-page-button {
     width: 2.25em;
     min-width: 2.25em;
     height: 2.25em;
@@ -35,7 +38,7 @@
     flex: 0 0 auto;
 }
 
-#galleryPlusPlus .gallery-page-button i {
+#gallery .gallery-page-button i {
     margin: 0;
     font-size: 0.9em;
 }
@@ -71,27 +74,27 @@
     margin-bottom: 0;
 }
 
-#galleryPlusPlus .dragTitle {
+#gallery .dragTitle {
     margin-right: 30px;
 }
 
-#dragGalleryPlusPlus {
+#dragGallery {
     min-height: 25dvh;
 }
 
-#galleryPlusPlus .right_menu_button.warning {
+#gallery .right_menu_button.warning {
     opacity: 1;
     filter: unset;
 }
 
-.galleryPlusPlusImageDraggable video {
+.galleryImageDraggable video {
     width: 100%;
 }
 
 /* The gallery stays just above the background but behind other SillyTavern UI.
    This intentionally overrides #movingDivs > div's default high stacking level. */
-#movingDivs > #galleryPlusPlus,
-#movingDivs > .galleryPlusPlusImageDraggable {
+#movingDivs > #gallery,
+#movingDivs > .galleryImageDraggable {
     z-index: 1 !important;
 }
 

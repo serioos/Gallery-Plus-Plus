@@ -6,11 +6,11 @@
     "js": "index.js",
     "css": "style.css",
     "author": "City-Unit / Gallery++ community fork",
-    "version": "1.0.0",
+    "version": "1.5.0",
+    "homePage": "https://github.com/serioos/Gallery-Plus-Plus",
     "auto_update": true,
     "minimum_client_version": "1.17.0",
-    "description": "A community fork of SillyTavern's Gallery with fixed left/right click image placement and improved third-party installation support.",
-    "homePage": "https://github.com/serioos/Gallery-Plus-Plus",
+    "description": "A community fork of SillyTavern's Gallery extension with improved page navigation, keyboard shortcuts, fixed-side image opening, viewport containment, persistence, and performance optimizations.",
     "hooks": {
         "activate": "init"
     }

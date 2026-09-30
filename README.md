@@ -1,25 +1,27 @@
-# Gallery++
+# Gallery++ Version 1.5.0
 
-A community fork of SillyTavern's Gallery extension. Gallery++ keeps the existing gallery, upload, sorting, folder, delete, pagination, image/video preview, and draggable-window behavior while adding fixed-side mouse actions:
+Gallery++ is a community fork of SillyTavern's Gallery extension. It keeps the normal gallery workflow—folders, sorting, upload, deletion, pagination, image/video preview, and draggable windows—while adding the fixes and quality-of-life changes listed below.
 
-- **Left click** a picture to open that exact picture on the **left side** of the screen.
-- **Right click** a picture to open that exact picture on the **right side** of the screen.
-- The image window side is independent of where the Gallery++ panel itself is positioned.
-- Right-click selection uses the actual thumbnail source URL, so mixed portrait/landscape dimensions do not shift the selected image.
+## Install directly from GitHub
 
-## Installation
+Gallery++ is structured as a SillyTavern third-party extension repository. The extension manifest is kept at the repository root so SillyTavern can install it from the repository URL.
 
-### SillyTavern extension installer
+1. In SillyTavern, open **Extensions** → **Install Extension**.
+2. Paste:
 
-1. Open **Extensions → Install Extension** in SillyTavern.
-2. Paste the URL of this GitHub repository.
-3. Install and reload SillyTavern.
+   `https://github.com/serioos/Gallery-Plus-Plus`
 
-SillyTavern's third-party installer installs the repository as an extension, so keep `manifest.json` at the repository root. The extension is packaged with its third-party asset path (`scripts/extensions/third-party/gallery-plus-plus/`) so the bundled nanogallery2 assets load correctly.
+3. Install the extension and reload SillyTavern when prompted.
 
-### Manual installation
+SillyTavern's documentation describes third-party installation by pasting a Git repository URL into **Extensions → Install Extension**: https://docs.sillytavern.app/extensions/
 
-Place the repository contents directly in:
+### Important for the built-in Gallery
+
+Gallery++ uses the Gallery UI IDs and slash commands from the original extension so it can act as a drop-in fork. For a single Gallery implementation, disable the built-in **Gallery** extension after installing Gallery++ rather than running both copies at the same time.
+
+## Manual installation
+
+The repository contents can also be placed directly in either of these locations:
 
 ```text
 SillyTavern/data/<your-user>/extensions/gallery-plus-plus/
@@ -31,30 +33,80 @@ or, for a global installation:
 SillyTavern/public/scripts/extensions/third-party/gallery-plus-plus/
 ```
 
-The folder must contain `manifest.json` and `index.js` directly; do not add another nested `gallery-plus-plus` folder.
+`manifest.json` and `index.js` must be directly inside the `gallery-plus-plus` directory.
+
+## Keyboard shortcuts
+
+| Shortcut | Action |
+| --- | --- |
+| `[` | Previous gallery page |
+| `]` | Next gallery page |
+| `\` | Toggle the Gallery++ panel open/closed |
+| `=` | Close all currently open gallery pictures |
+
+Gallery++ only handles these shortcuts when focus is not inside an input, textarea, select, or contenteditable element. It also ignores the shortcuts while a SillyTavern popup is open.
+
+## Mouse actions
+
+- **Left-click** an image to open that exact image on the **left** side of the screen.
+- **Right-click** an image to open that exact image on the **right** side of the screen.
+
+The image window side is independent of the side where the Gallery++ panel itself is positioned.
+
+## Gallery panel positioning
+
+Gallery++ includes a left/right positioning toggle for the gallery panel. The selected side is persisted in SillyTavern settings and restored after restarting SillyTavern.
+
+Opened gallery pictures are kept at a background-level z-layer so other SillyTavern UI can appear above them. The same low stacking level is re-applied after dragging/focusing an opened picture.
+
+## What changed in v1.5.0
+
+Compared with the vanilla SillyTavern Gallery 1.5.0:
+
+- Fixed gallery **page navigation controls** being pushed below the viewport on 1080p displays.
+- Replaced oversized page flippers with **small left/right buttons beside “Add Image.”**
+- Added **`[` / `]` keyboard shortcuts** for previous/next gallery pages.
+- Added left-click → open image on the left side of the screen.
+- Added right-click → open image on the right side of the screen.
+- `\` — Toggle the gallery panel open/closed.
+- `=` — Close all currently open gallery pictures.
+- Hotkeys only activate when **not typing** in an input field.
+- Fixed the **character gallery-folder dropdown** so selected folders persist and reopen correctly.
+- Fixed **partially loaded gallery pages** after page flips by stabilizing image loading and layout recalculation.
+- Prevented tall/portrait images from **spilling outside the gallery panel** and under the taskbar.
+- Added a **left/right gallery positioning toggle**, with the selected side persisted across SillyTavern restarts.
+- Moved the Gallery panel to a **background-level z-layer** so other UI elements can layer above it.
+- Applied the same **low z-layer behavior to opened gallery images**, including after dragging/focusing them.
+- Optimized gallery performance with **thumbnail caching, bounded loading, folder caching, reduced delays, and improved layout handling**.
+- Improved cleanup and fixed a **mutation-observer teardown leak**.
+- Fixed the **video-extension matching regex**.
+- Fixed file-picker behavior when **selecting the same image again**.
+- Prevented duplicate **Gallery wand buttons** during repeated initialization.
+- Hardened folder restoration when **character data is unavailable**.
+- Added a visible **error notification when gallery loading fails**.
+- Removed minor redundant CSS/code.
+- Renamed the fork to **Gallery++**.
 
 ## Compatibility
 
-Gallery++ targets SillyTavern **1.17.0 or newer** because it uses the modern extension lifecycle hook declared in `manifest.json`. The current SillyTavern release is **1.19.0** as of 2026-09-30.
+The manifest uses SillyTavern's modern extension lifecycle hook and declares **SillyTavern 1.17.0+** as the minimum client version for this packaged build.
 
-## Notes for existing Gallery users
+## Files
 
-Gallery++ uses its own extension settings namespace and UI IDs so it can be installed as a separate third-party extension without colliding with the built-in Gallery. On first run, it copies existing `gallery` settings (folder overrides, sorting, and panel side) into the Gallery++ settings namespace.
+```text
+Gallery-Plus-Plus/
+├── CHANGELOG.md
+├── LICENSE
+├── NOTICE.md
+├── README.md
+├── index.i18n.html
+├── index.js
+├── jquery.nanogallery2.min.js
+├── manifest.json
+├── nanogallery2.woff.min.css
+└── style.css
+```
 
-For a single Gallery button and command set, disable the built-in Gallery after installing Gallery++.
+## Attribution and license
 
-## Changes in 1.0.0
-
-- Renamed the fork to **Gallery++**.
-- Added left-click → left-side opening.
-- Added right-click → right-side opening.
-- Right-click selection is based on the thumbnail's real source URL.
-- Made the extension safe to install from a GitHub repository as a third-party extension.
-- Added isolated settings/UI namespaces and migration from the original Gallery settings.
-- Renamed slash commands to avoid collisions:
-  - `/show-gallery-plus` (`/sgp`)
-  - `/list-gallery-plus` (`/lgp`)
-
-## License and attribution
-
-Gallery++ is a modified version of SillyTavern's Gallery extension, originally authored by City-Unit. The derived source is distributed under **AGPL-3.0**; see `LICENSE` and `NOTICE.md`.
+Gallery++ is a modified version of the Gallery extension included with SillyTavern and originally authored by **City-Unit**. The derived source is distributed under the **GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)**. See `LICENSE` and `NOTICE.md`.
