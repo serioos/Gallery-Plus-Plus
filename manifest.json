@@ -10,6 +10,7 @@
     "auto_update": true,
     "minimum_client_version": "1.17.0",
     "description": "A community fork of SillyTavern's Gallery with fixed left/right click image placement and improved third-party installation support.",
+    "homePage": "https://github.com/serioos/Gallery-Plus-Plus",
     "hooks": {
         "activate": "init"
     }
