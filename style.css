@@ -1,31 +1,43 @@
-/* Gallery++ Version 1.5.0 — modified from SillyTavern's Gallery extension.
+/* Gallery++ Version 1.6.2 — derived from SillyTavern's Gallery extension.
  * SPDX-License-Identifier: AGPL-3.0-or-later */
 
 /* Keep the gallery contained inside the usable viewport. The extension also
    limits nanogallery2 to a safe number of rows so portrait-heavy pages never
    push the panel underneath the browser/taskbar. */
-#gallery {
+#galleryPlusPlus {
     max-height: calc(100dvh - 4px);
     box-sizing: border-box;
     overflow: hidden !important;
 }
 
-#gallery #dragGallery {
+#galleryPlusPlus #dragGalleryPlusPlus {
     max-height: calc(82dvh - 180px);
     overflow: hidden;
 }
 
-#gallery .nGY2 {
+#galleryPlusPlus .nGY2 {
     max-width: 100%;
     max-height: 100%;
     overflow: hidden;
+    contain: layout paint;
 }
 
-#gallery .nGY2GalleryBottom {
+#galleryPlusPlus .nGY2GThumbnail {
+    /* The grid has fixed geometry, so off-screen tile contents can be skipped. */
+    content-visibility: auto;
+    contain-intrinsic-size: 144px 256px;
+    contain: layout paint;
+}
+
+#galleryPlusPlus .nGY2GThumbnailImg {
+    image-rendering: auto;
+}
+
+#galleryPlusPlus .nGY2GalleryBottom {
     display: none !important;
 }
 
-#gallery .gallery-page-button {
+#galleryPlusPlus .gallery-plus-plus-page-button {
     width: 2.25em;
     min-width: 2.25em;
     height: 2.25em;
@@ -38,25 +50,25 @@
     flex: 0 0 auto;
 }
 
-#gallery .gallery-page-button i {
+#galleryPlusPlus .gallery-plus-plus-page-button i {
     margin: 0;
     font-size: 0.9em;
 }
 
-.gallery-folder-input {
+.gallery-plus-plus-folder-input {
     background-color: transparent;
     font-size: calc(var(--mainFontSize)* 0.9);
     opacity: 0.8;
     flex-grow: 1;
 }
 
-.gallery-folder-input:placeholder-shown {
+.gallery-plus-plus-folder-input:placeholder-shown {
     font-style: italic;
     opacity: 0.5;
     border-color: transparent;
 }
 
-.gallery-sort-select {
+.gallery-plus-plus-sort-select {
     width: 100%;
     flex: 1;
     cursor: pointer;
@@ -74,31 +86,31 @@
     margin-bottom: 0;
 }
 
-#gallery .dragTitle {
+#galleryPlusPlus .dragTitle {
     margin-right: 30px;
 }
 
-#dragGallery {
+#dragGalleryPlusPlus {
     min-height: 25dvh;
 }
 
-#gallery .right_menu_button.warning {
+#galleryPlusPlus .right_menu_button.warning {
     opacity: 1;
     filter: unset;
 }
 
-.galleryImageDraggable video {
+.galleryPlusPlusImageDraggable video {
     width: 100%;
 }
 
 /* The gallery stays just above the background but behind other SillyTavern UI.
    This intentionally overrides #movingDivs > div's default high stacking level. */
-#movingDivs > #gallery,
-#movingDivs > .galleryImageDraggable {
+#movingDivs > #galleryPlusPlus,
+#movingDivs > .galleryPlusPlusImageDraggable {
     z-index: 1 !important;
 }
 
-.gallery-side-toggle {
+.gallery-plus-plus-side-toggle {
     width: 2.25em;
     min-width: 2.25em;
     padding-left: 0;
@@ -109,7 +121,7 @@
     justify-content: center;
 }
 
-.gallery-side-toggle.toggled {
+.gallery-plus-plus-side-toggle.toggled {
     border-color: var(--active);
 }
 
