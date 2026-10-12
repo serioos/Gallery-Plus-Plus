@@ -1,8 +1,9 @@
 /*
- * Gallery++ Version 1.6.3
+ * Gallery++ Version 1.6.2
  * Modified from SillyTavern's Gallery extension, originally authored by City-Unit.
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
+
 import {
     eventSource,
     getRequestHeaders,
@@ -31,7 +32,9 @@ const isVideo = (/** @type {string} */ url) => {
         return lowerUrl.endsWith(normalizedExt.startsWith('.') ? normalizedExt : `.${normalizedExt}`);
     });
 };
-// Resolve bundled assets from this module's actual installed URL.
+// Resolve bundled assets from the actual installed extension URL.
+// This works for both user-scoped and all-users third-party installs, regardless
+// of the repository/folder name SillyTavern chooses for the clone.
 const extensionBaseUrl = new URL('.', import.meta.url);
 const getExtensionAssetUrl = (fileName) => new URL(fileName, extensionBaseUrl).href;
 let galleryWelcomeShown = false;
@@ -48,7 +51,7 @@ const GALLERY_THUMBNAIL_CONCURRENCY = 2;
 const GALLERY_THUMBNAIL_MAX_SIDE = 256;
 const GALLERY_THUMBNAIL_MEMORY_LIMIT = 200;
 const GALLERY_FOLDERS_CACHE_TTL = 15_000;
-const GALLERY_CACHE_DB_NAME = 'ST_Gallery_Plus_Plus_Cache';
+const GALLERY_CACHE_DB_NAME = 'ST_Gallery_Cache';
 const GALLERY_CACHE_DB_VERSION = 1;
 const GALLERY_CACHE_STORE_NAME = 'thumbnails';
 let galleryDBPromise = null;
@@ -58,14 +61,14 @@ const DEFAULT_GALLERY_SIDE = 'left';
 const GALLERY_BACK_Z_INDEX = '1';
 
 
-const CUSTOM_GALLERY_REMOVED_EVENT = 'galleryPlusPlusRemoved';
+const CUSTOM_GALLERY_REMOVED_EVENT = 'galleryRemoved';
 
 /**
  * Emits the gallery teardown event and removes the outer panel. Keeping this
  * explicit avoids observing SillyTavern's entire document subtree for removals.
  */
 function removeGalleryPanel() {
-    const panel = $('#movingDivs > #galleryPlusPlus');
+    const panel = $('#movingDivs > #gallery');
     if (!panel.length) return;
     eventSource.emit(CUSTOM_GALLERY_REMOVED_EVENT);
     panel.remove();
@@ -81,7 +84,7 @@ $('#movingDivs').on('click', '.dragClose', function () {
         duration: animation_duration,
         easing: animation_easing,
         complete: () => {
-            if (relatedId === 'galleryPlusPlus') {
+            if (relatedId === 'gallery') {
                 eventSource.emit(CUSTOM_GALLERY_REMOVED_EVENT);
             }
             relatedElement.remove();
@@ -108,33 +111,16 @@ const defaultSettings = Object.freeze({
 function initSettings() {
     let shouldSave = false;
     const context = SillyTavern.getContext();
-    const extensionSettings = context.extensionSettings;
-
-    if (!extensionSettings.galleryPlusPlus || typeof extensionSettings.galleryPlusPlus !== 'object') {
-        const legacySettings = extensionSettings.gallery && typeof extensionSettings.gallery === 'object'
-            ? extensionSettings.gallery
-            : {};
-        const migratedSettings = structuredClone(defaultSettings);
-        for (const key of Object.keys(defaultSettings)) {
-            if (Object.hasOwn(legacySettings, key)) {
-                migratedSettings[key] = structuredClone(legacySettings[key]);
-            }
-        }
-        migratedSettings.folders = {
-            ...structuredClone(defaultSettings.folders),
-            ...(legacySettings.folders && typeof legacySettings.folders === 'object' ? legacySettings.folders : {}),
-        };
-        extensionSettings.galleryPlusPlus = migratedSettings;
+    if (!context.extensionSettings.gallery) {
+        context.extensionSettings.gallery = structuredClone(defaultSettings);
         shouldSave = true;
     }
-
     for (const key of Object.keys(defaultSettings)) {
-        if (!Object.hasOwn(extensionSettings.galleryPlusPlus, key)) {
-            extensionSettings.galleryPlusPlus[key] = structuredClone(defaultSettings[key]);
+        if (!Object.hasOwn(context.extensionSettings.gallery, key)) {
+            context.extensionSettings.gallery[key] = structuredClone(defaultSettings[key]);
             shouldSave = true;
         }
     }
-
     if (shouldSave) {
         context.saveSettingsDebounced();
     }
@@ -149,7 +135,7 @@ function initSettings() {
  */
 function getGalleryFolder(char) {
     const context = SillyTavern.getContext();
-    const folders = context.extensionSettings.galleryPlusPlus?.folders ?? {};
+    const folders = context.extensionSettings.gallery?.folders ?? {};
     return folders[char?.avatar] ?? char?.name;
 }
 
@@ -170,7 +156,7 @@ function getCurrentGalleryCharacter() {
  * @returns {'left'|'right'} The configured side
  */
 function getGallerySide() {
-    const side = SillyTavern.getContext().extensionSettings.galleryPlusPlus.side;
+    const side = SillyTavern.getContext().extensionSettings.gallery.side;
     return side === 'right' ? 'right' : DEFAULT_GALLERY_SIDE;
 }
 
@@ -180,7 +166,7 @@ function getGallerySide() {
  */
 function setGallerySide(side) {
     const context = SillyTavern.getContext();
-    context.extensionSettings.galleryPlusPlus.side = side === 'right' ? 'right' : DEFAULT_GALLERY_SIDE;
+    context.extensionSettings.gallery.side = side === 'right' ? 'right' : DEFAULT_GALLERY_SIDE;
     context.saveSettingsDebounced();
 }
 
@@ -560,7 +546,7 @@ function applyGalleryBackLayer(element) {
 
 function applyGallerySideToOpenWindows(forceMirror = false) {
     const side = getGallerySide();
-    const elements = $('#galleryPlusPlus, .galleryPlusPlusImageDraggable');
+    const elements = $('#gallery, .galleryImageDraggable');
 
     elements.each(function () {
         const element = $(this);
@@ -600,7 +586,7 @@ function toggleGallerySide() {
 
 /**
  * Fetches the raw filenames from the server, without creating UI items or
- * generating any thumbnails. Shared by the gallery and /list-gallery-plus command.
+ * generating any thumbnails. Shared by the gallery and /list-gallery command.
  * @param {string} url Gallery folder
  * @returns {Promise<string[]>}
  */
@@ -699,7 +685,7 @@ async function deleteGalleryItem(url) {
  */
 function setSortOrder(order) {
     const context = SillyTavern.getContext();
-    context.extensionSettings.galleryPlusPlus.sort = order;
+    context.extensionSettings.gallery.sort = order;
     context.saveSettingsDebounced();
 }
 
@@ -708,7 +694,7 @@ function setSortOrder(order) {
  * @returns {string} The current sort order for the gallery.
  */
 function getSortOrder() {
-    return SillyTavern.getContext().extensionSettings.galleryPlusPlus.sort ?? defaultSettings.sort;
+    return SillyTavern.getContext().extensionSettings.gallery.sort ?? defaultSettings.sort;
 }
 
 /**
@@ -730,7 +716,7 @@ async function initGallery(items, url) {
     const galleryMaxRows = getGalleryMaxRows(thumbnailHeight);
 
     const nonce = `nonce-${Math.random().toString(36).substring(2, 15)}`;
-    const gallery = $('#dragGalleryPlusPlus');
+    const gallery = $('#dragGallery');
     gallery.addClass(nonce);
     gallery.nanogallery2({
         'items': items,
@@ -775,8 +761,8 @@ async function initGallery(items, url) {
     // so right-click needs a native contextmenu handler of its own. Resolve
     // the clicked picture by the source URL stored on the thumbnail rather
     // than by nanogallery2's internal data-idx.
-    gallery.off('contextmenu.galleryPlusPlus');
-    gallery.on('contextmenu.galleryPlusPlus', '.nGY2GThumbnail', function (event) {
+    gallery.off('contextmenu.gallery');
+    gallery.on('contextmenu.gallery', '.nGY2GThumbnail', function (event) {
         if (event.button !== 2) return;
 
         const itemUrl = this.getAttribute('data-gallery-src');
@@ -790,7 +776,7 @@ async function initGallery(items, url) {
         }], 'right');
     });
 
-    const dragDropHandler = new DragAndDropHandler(`#dragGalleryPlusPlus.${nonce}`, async (files) => {
+    const dragDropHandler = new DragAndDropHandler(`#dragGallery.${nonce}`, async (files) => {
         if (!Array.isArray(files) || files.length === 0) {
             return;
         }
@@ -805,7 +791,7 @@ async function initGallery(items, url) {
     });
 
     const resizeHandler = function () {
-        if (gallery.closest('#galleryPlusPlus').length) {
+        if (gallery.closest('#gallery').length) {
             gallery.nanogallery2('resize');
         }
     };
@@ -825,9 +811,9 @@ async function initGallery(items, url) {
             // The gallery may already have been destroyed during a replacement.
             console.debug('Gallery cleanup skipped:', error);
         }
-        gallery.off('contextmenu.galleryPlusPlus');
-        gallery.removeData('gallery-plus-plus-source-items');
-        gallery.removeData('gallery-plus-plus-cleanup');
+        gallery.off('contextmenu.gallery');
+        gallery.removeData('gallery-source-items');
+        gallery.removeData('gallery-cleanup');
         dragDropHandler.destroy();
         eventSource.removeListener('resizeUI', resizeHandler);
         eventSource.removeListener(event_types.CHAT_CHANGED, chatChangedHandler);
@@ -837,7 +823,7 @@ async function initGallery(items, url) {
     eventSource.on('resizeUI', resizeHandler);
     eventSource.on(event_types.CHAT_CHANGED, chatChangedHandler);
     eventSource.once(CUSTOM_GALLERY_REMOVED_EVENT, cleanup);
-    gallery.data('gallery-plus-plus-cleanup', cleanup);
+    gallery.data('gallery-cleanup', cleanup);
 
     // Fixed-size grid thumbnails need no image-load race or forced resize.
     gallery.css('height', 'unset');
@@ -845,34 +831,34 @@ async function initGallery(items, url) {
 
 /** Returns the active folder recorded on the mounted gallery panel. */
 function getOpenGalleryUrl(fallback) {
-    const value = $('#galleryPlusPlus').attr('data-gallery-url');
+    const value = $('#gallery').attr('data-gallery-url');
     return value === undefined || value === '' ? fallback : value;
 }
 
 /**
  * Installs items in an existing modal when possible. The inner nanogallery2
- * instance and its handlers are destroyed/recreated while #galleryPlusPlus stays put.
+ * instance and its handlers are destroyed/recreated while #gallery stays put.
  * @param {Array<Object>} items
  * @param {string} url
  * @param {number} requestToken
  */
 async function renderGalleryItems(items, url, requestToken) {
     if (requestToken !== galleryRequestToken) return;
-    let panel = $('#movingDivs > #galleryPlusPlus');
+    let panel = $('#movingDivs > #gallery');
 
     if (panel.length) {
         panel.attr('data-gallery-url', String(url ?? ''));
-        const gallery = panel.find('#dragGalleryPlusPlus');
-        const cleanup = gallery.data('gallery-plus-plus-cleanup');
+        const gallery = panel.find('#dragGallery');
+        const cleanup = gallery.data('gallery-cleanup');
         if (typeof cleanup === 'function') cleanup();
-        gallery.off('contextmenu.galleryPlusPlus')
-            .removeData('gallery-plus-plus-cleanup')
+        gallery.off('contextmenu.gallery')
+            .removeData('gallery-cleanup')
             .removeClass()
             .empty()
             .css('height', 'unset');
     } else {
         await makeMovable(url);
-        panel = $('#movingDivs > #galleryPlusPlus');
+        panel = $('#movingDivs > #gallery');
         if (requestToken !== galleryRequestToken) {
             removeGalleryPanel();
             return;
@@ -891,14 +877,14 @@ async function renderGalleryItems(items, url, requestToken) {
  * @returns {Promise<void>}
  */
 async function refreshGalleryContent(url) {
-    if (!$('#movingDivs > #galleryPlusPlus').length) {
+    if (!$('#movingDivs > #gallery').length) {
         return showCharGallery(deleteModeActive);
     }
 
     const requestToken = ++galleryRequestToken;
     try {
         const items = await getGalleryItems(url);
-        if (requestToken !== galleryRequestToken || !$('#movingDivs > #galleryPlusPlus').length) return;
+        if (requestToken !== galleryRequestToken || !$('#movingDivs > #gallery').length) return;
         await renderGalleryItems(items, url, requestToken);
     } catch (error) {
         console.error('Failed to refresh gallery:', error);
@@ -978,7 +964,7 @@ async function uploadFile(file, url) {
  * @returns {Promise<void>} - Promise representing the completion of the draggable container creation.
  */
 async function makeMovable(url) {
-    const id = 'galleryPlusPlus';
+    const id = 'gallery';
     const template = $('#generic_draggable_template').html();
     const newElement = $(template);
     newElement.css({ 'background-color': 'var(--SmartThemeBlurTintColor)', 'opacity': 0 });
@@ -997,7 +983,7 @@ async function makeMovable(url) {
     controlsContainer.classList.add('flex-container', 'alignItemsCenter');
 
     const sortSelect = document.createElement('select');
-    sortSelect.classList.add('gallery-plus-plus-sort-select');
+    sortSelect.classList.add('gallery-sort-select');
 
     for (const sort of Object.values(SORT)) {
         const option = document.createElement('option');
@@ -1016,7 +1002,7 @@ async function makeMovable(url) {
     controlsContainer.appendChild(sortSelect);
 
     const gallerySideToggle = document.createElement('div');
-    gallerySideToggle.classList.add('menu_button', 'menu_button_icon', 'interactable', 'gallery-plus-plus-side-toggle');
+    gallerySideToggle.classList.add('menu_button', 'menu_button_icon', 'interactable', 'gallery-side-toggle');
     const updateGallerySideToggle = () => {
         const side = getGallerySide();
         gallerySideToggle.classList.toggle('toggled', side === 'right');
@@ -1046,12 +1032,12 @@ async function makeMovable(url) {
      */
     const createPageButton = (direction, icon, label) => {
         const button = document.createElement('div');
-        button.classList.add('menu_button', 'menu_button_icon', 'interactable', 'gallery-plus-plus-page-button');
+        button.classList.add('menu_button', 'menu_button_icon', 'interactable', 'gallery-page-button');
         button.title = label;
         button.setAttribute('aria-label', label);
         button.innerHTML = `<i class="${icon}"></i>`;
         button.addEventListener('click', () => {
-            const liveGallery = $('#dragGalleryPlusPlus');
+            const liveGallery = $('#dragGallery');
             if (!liveGallery.length) return;
             const instance = liveGallery.nanogallery2('instance');
             if (!instance) return;
@@ -1156,7 +1142,7 @@ async function makeMovable(url) {
             galleryFolderInput.value = newUrl;
             galleryFoldersCache = null;
             galleryFoldersCacheTime = 0;
-            $('#galleryPlusPlus').attr('data-gallery-url', newUrl);
+            $('#gallery').attr('data-gallery-url', newUrl);
             await refreshGalleryContent(newUrl);
             toastr.info(t`Gallery folder changed to ${newUrl}`);
         } catch (error) {
@@ -1170,7 +1156,7 @@ async function makeMovable(url) {
             restoreGalleryFolder();
             const restoredUrl = getGalleryFolder(getCurrentGalleryCharacter());
             galleryFolderInput.value = restoredUrl;
-            $('#galleryPlusPlus').attr('data-gallery-url', restoredUrl);
+            $('#gallery').attr('data-gallery-url', restoredUrl);
             await refreshGalleryContent(restoredUrl);
         } catch (error) {
             console.error('Failed to restore gallery folder:', error);
@@ -1183,7 +1169,7 @@ async function makeMovable(url) {
     galleryFolderInput.placeholder = t`Folder Name`;
     galleryFolderInput.title = t`Enter a folder name to change the gallery folder`;
     galleryFolderInput.value = url;
-    galleryFolderInput.classList.add('text_pole', 'gallery-plus-plus-folder-input', 'flex1');
+    galleryFolderInput.classList.add('text_pole', 'gallery-folder-input', 'flex1');
     galleryFolderInput.addEventListener('keyup', onChangeFolder);
 
     const galleryFolderAccept = document.createElement('div');
@@ -1235,9 +1221,9 @@ async function makeMovable(url) {
         .on('focus', () => $(galleryFolderInput).autocomplete('search', ''));
 
     //add a div for the gallery
-    newElement.append('<div id="dragGalleryPlusPlus"></div>');
+    newElement.append('<div id="dragGallery"></div>');
 
-    $('#dragGalleryPlusPlus').css('display', 'block');
+    $('#dragGallery').css('display', 'block');
 
     $('#movingDivs').append(newElement);
 
@@ -1284,7 +1270,7 @@ function updateGalleryFolder(newUrl, characterRef = {}) {
         throw new Error('Character PNG ID is not found');
     }
 
-    const currentGallerySettings = context.extensionSettings.galleryPlusPlus ?? (context.extensionSettings.galleryPlusPlus = {});
+    const currentGallerySettings = context.extensionSettings.gallery ?? (context.extensionSettings.gallery = {});
     const existingFolders = currentGallerySettings.folders && typeof currentGallerySettings.folders === 'object'
         ? currentGallerySettings.folders
         : {};
@@ -1319,13 +1305,13 @@ function restoreGalleryFolder() {
     if (!avatar) {
         throw new Error('Character PNG ID is not found');
     }
-    const existingOverride = context.extensionSettings.galleryPlusPlus.folders[avatar];
+    const existingOverride = context.extensionSettings.gallery.folders[avatar];
     if (!existingOverride) {
         throw new Error('No folder override found');
     }
-    const folders = { ...(context.extensionSettings.galleryPlusPlus?.folders ?? {}) };
+    const folders = { ...(context.extensionSettings.gallery?.folders ?? {}) };
     delete folders[avatar];
-    context.extensionSettings.galleryPlusPlus.folders = folders;
+    context.extensionSettings.gallery.folders = folders;
     context.saveSettingsDebounced();
 }
 
@@ -1376,8 +1362,8 @@ function makeDragImg(id, url, side = 'left') {
         }
         draggableElem.id = uniqueId;
 
-        // Add the galleryPlusPlusImageDraggable to have unique class
-        draggableElem.classList.add('galleryPlusPlusImageDraggable');
+        // Add the galleryImageDraggable to have unique class
+        draggableElem.classList.add('galleryImageDraggable');
 
         // Ensure that the newly added element is displayed as block
         draggableElem.style.display = 'block';
@@ -1469,8 +1455,8 @@ function viewWithDragbox(items, side = 'left') {
 
 // Registers a simple command for opening the char gallery.
 SlashCommandParser.addCommandObject(SlashCommand.fromProps({
-    name: 'show-gallery-plus',
-    aliases: ['sgp'],
+    name: 'show-gallery',
+    aliases: ['sg'],
     callback: () => {
         showCharGallery();
         return '';
@@ -1478,8 +1464,8 @@ SlashCommandParser.addCommandObject(SlashCommand.fromProps({
     helpString: 'Shows the gallery.',
 }));
 SlashCommandParser.addCommandObject(SlashCommand.fromProps({
-    name: 'list-gallery-plus',
-    aliases: ['lgp'],
+    name: 'list-gallery',
+    aliases: ['lg'],
     callback: listGalleryCommand,
     returns: 'list of images',
     namedArgumentList: [
@@ -1535,7 +1521,7 @@ function isTypingInGalleryContext() {
  * cannot recreate the panel after the user has closed it.
  */
 function toggleGalleryPanel() {
-    const galleryPanel = $('#dragGalleryPlusPlus').closest('#galleryPlusPlus');
+    const galleryPanel = $('#dragGallery').closest('#gallery');
     if (galleryPanel.length) {
         galleryRequestToken++;
         removeGalleryPanel();
@@ -1550,7 +1536,7 @@ function toggleGalleryPanel() {
  * existing close button keeps the normal draggable cleanup/animation path.
  */
 function closeAllGalleryImages() {
-    $('.galleryPlusPlusImageDraggable .dragClose').each(function () {
+    $('.galleryImageDraggable .dragClose').each(function () {
         this.click();
     });
 }
@@ -1582,7 +1568,7 @@ function handleGalleryHotkeys(event) {
 
     if (event.key !== '[' && event.key !== ']') return;
 
-    const gallery = $('#dragGalleryPlusPlus');
+    const gallery = $('#dragGallery');
     if (!gallery.length) return;
 
     const instance = gallery.nanogallery2('instance');
@@ -1601,11 +1587,11 @@ function addGalleryWandButton() {
     if (!(showGalleryContainer instanceof HTMLElement)) {
         return;
     }
-    if (document.getElementById('show_gallery_plus_plus_wand_button')) {
+    if (document.getElementById('show_gallery_wand_button')) {
         return;
     }
     const showGalleryButton = document.createElement('div');
-    showGalleryButton.id = 'show_gallery_plus_plus_wand_button';
+    showGalleryButton.id = 'show_gallery_wand_button';
     showGalleryButton.classList.add('list-group-item', 'flex-container', 'flexGap5');
     const showGalleryIcon = document.createElement('div');
     showGalleryIcon.classList.add('fa-solid', 'fa-sd-card', 'extensionsMenuExtensionButton');
@@ -1640,10 +1626,10 @@ export async function init() {
     }
     eventSource.on(event_types.CHARACTER_RENAMED, (oldAvatar, newAvatar) => {
         const context = SillyTavern.getContext();
-        const galleryFolder = context.extensionSettings.galleryPlusPlus.folders[oldAvatar];
+        const galleryFolder = context.extensionSettings.gallery.folders[oldAvatar];
         if (galleryFolder) {
-            context.extensionSettings.galleryPlusPlus.folders[newAvatar] = galleryFolder;
-            delete context.extensionSettings.galleryPlusPlus.folders[oldAvatar];
+            context.extensionSettings.gallery.folders[newAvatar] = galleryFolder;
+            delete context.extensionSettings.gallery.folders[oldAvatar];
             context.saveSettingsDebounced();
         }
     });
@@ -1651,11 +1637,11 @@ export async function init() {
         const avatar = data?.character?.avatar;
         if (!avatar) return;
         const context = SillyTavern.getContext();
-        delete context.extensionSettings.galleryPlusPlus.folders[avatar];
+        delete context.extensionSettings.gallery.folders[avatar];
         context.saveSettingsDebounced();
     });
     eventSource.on(event_types.CHARACTER_MANAGEMENT_DROPDOWN, (selectedOptionId) => {
-        if (selectedOptionId === 'show_char_gallery_plus_plus') {
+        if (selectedOptionId === 'show_char_gallery') {
             showCharGallery();
         }
     });
@@ -1663,7 +1649,7 @@ export async function init() {
     // Add an option to the dropdown
     $('#char-management-dropdown').append(
         $('<option>', {
-            id: 'show_char_gallery_plus_plus',
+            id: 'show_char_gallery',
             text: translate('Show Gallery'),
         }),
     );
