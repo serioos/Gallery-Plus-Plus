@@ -12,6 +12,7 @@ Gallery++ is structured as a SillyTavern third-party extension repository. The e
    `https://github.com/serioos/Gallery-Plus-Plus`
 
 3. Install the extension and reload SillyTavern when prompted.
+4. Make sure you disable the vanilla Gallery extension when you have Gallery++ installed. Do not use both at the same time.
 
 SillyTavern's documentation describes third-party installation by pasting a Git repository URL into **Extensions → Install Extension**: https://docs.sillytavern.app/extensions/
 
