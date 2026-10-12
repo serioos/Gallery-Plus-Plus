@@ -1,5 +1,5 @@
 /*
- * Gallery++ Version 1.6.2
+ * Gallery++ Version 1.6.3
  * Modified from SillyTavern's Gallery extension, originally authored by City-Unit.
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
@@ -9,20 +9,20 @@ import {
     event_types,
     animation_duration,
     animation_easing,
-} from '../../../script.js';
-import { groups, selected_group } from '../../group-chats.js';
-import { loadFileToDocument, getBase64Async, getSanitizedFilename, saveBase64AsFile, getFileExtension, getVideoThumbnail, clamp } from '../../utils.js';
-import { power_user } from '../../power-user.js';
-import { dragElement } from '../../RossAscends-mods.js';
-import { SlashCommandParser } from '../../slash-commands/SlashCommandParser.js';
-import { SlashCommand } from '../../slash-commands/SlashCommand.js';
-import { ARGUMENT_TYPE, SlashCommandNamedArgument } from '../../slash-commands/SlashCommandArgument.js';
-import { DragAndDropHandler } from '../../dragdrop.js';
-import { commonEnumProviders } from '../../slash-commands/SlashCommandCommonEnumsProvider.js';
-import { t, translate } from '../../i18n.js';
-import { Popup } from '../../popup.js';
-import { deleteMediaFromServer } from '../../chats.js';
-import { MEDIA_REQUEST_TYPE, VIDEO_EXTENSIONS } from '../../constants.js';
+} from '../../../../script.js';
+import { groups, selected_group } from '../../../group-chats.js';
+import { loadFileToDocument, getBase64Async, getSanitizedFilename, saveBase64AsFile, getFileExtension, getVideoThumbnail, clamp } from '../../../utils.js';
+import { power_user } from '../../../power-user.js';
+import { dragElement } from '../../../RossAscends-mods.js';
+import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
+import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
+import { ARGUMENT_TYPE, SlashCommandNamedArgument } from '../../../slash-commands/SlashCommandArgument.js';
+import { DragAndDropHandler } from '../../../dragdrop.js';
+import { commonEnumProviders } from '../../../slash-commands/SlashCommandCommonEnumsProvider.js';
+import { t, translate } from '../../../i18n.js';
+import { Popup } from '../../../popup.js';
+import { deleteMediaFromServer } from '../../../chats.js';
+import { MEDIA_REQUEST_TYPE, VIDEO_EXTENSIONS } from '../../../constants.js';
 
 const isVideo = (/** @type {string} */ url) => {
     const lowerUrl = String(url).toLowerCase();
@@ -31,8 +31,9 @@ const isVideo = (/** @type {string} */ url) => {
         return lowerUrl.endsWith(normalizedExt.startsWith('.') ? normalizedExt : `.${normalizedExt}`);
     });
 };
-const extensionName = 'gallery-plus-plus';
-const extensionFolderPath = `scripts/extensions/third-party/${extensionName}/`;
+// Resolve bundled assets from this module's actual installed URL.
+const extensionBaseUrl = new URL('.', import.meta.url);
+const getExtensionAssetUrl = (fileName) => new URL(fileName, extensionBaseUrl).href;
 let galleryWelcomeShown = false;
 let galleryAssetsPromise = null;
 let deleteModeActive = false;
@@ -465,8 +466,8 @@ function loadGalleryThumbnail($thumbnail, item) {
 function loadGalleryAssets() {
     if (!galleryAssetsPromise) {
         galleryAssetsPromise = Promise.all([
-            loadFileToDocument(`${extensionFolderPath}nanogallery2.woff.min.css`, 'css'),
-            loadFileToDocument(`${extensionFolderPath}jquery.nanogallery2.min.js`, 'js'),
+            loadFileToDocument(getExtensionAssetUrl('nanogallery2.woff.min.css'), 'css'),
+            loadFileToDocument(getExtensionAssetUrl('jquery.nanogallery2.min.js'), 'js'),
         ]).catch(error => {
             galleryAssetsPromise = null;
             throw error;

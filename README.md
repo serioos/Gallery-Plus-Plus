@@ -2,8 +2,9 @@
 
 Gallery++ is a community fork of SillyTavern's Gallery extension, originally authored by City-Unit. It keeps image/video browsing, upload, sorting, folder overrides, deletion, pagination, and draggable previews, with fixed-side image opening and performance improvements for large portrait-heavy galleries.
 
-## Highlights in 1.6.2
+## Highlights in 1.6.3
 
+- Fixes third-party module imports and resolves bundled asset URLs relative to the installed extension path.
 - Uses fixed **9:16 portrait thumbnails** for a consistent grid with mixed image dimensions.
 - Caches generated image/video thumbnails in memory and IndexedDB to speed up revisits.
 - Limits thumbnail-generation concurrency and lazily generates thumbnails as tiles are needed.
@@ -21,7 +22,7 @@ Gallery++ is a community fork of SillyTavern's Gallery extension, originally aut
 2. Paste `https://github.com/serioos/Gallery-Plus-Plus`.
 3. Install and reload SillyTavern.
 
-Keep `manifest.json` at the repository root. The bundled nanogallery2 resources are loaded from SillyTavern's third-party extension asset path.
+Keep `manifest.json` at the repository root. Bundled nanogallery2 resources are resolved relative to `index.js`, so both user-scoped and global third-party installs can find them.
 
 ### Manual installation
 

@@ -1,5 +1,11 @@
 # Gallery++ Extension — Changelog
 
+## v1.6.3
+
+- Fixed third-party extension import paths so SillyTavern core modules resolve when installed from GitHub.
+- Changed bundled nanogallery2 asset URLs to resolve relative to the installed extension module, supporting user-scoped and global installs.
+- Kept the 9:16 thumbnail, caching, and Gallery++ isolation changes from v1.6.2.
+
 ## v1.6.2
 
 - Changed the thumbnail grid to fixed 9:16 portrait tiles for predictable geometry with mixed image sizes.

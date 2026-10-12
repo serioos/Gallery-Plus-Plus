@@ -6,11 +6,11 @@
     "js": "index.js",
     "css": "style.css",
     "author": "City-Unit / Gallery++ community fork",
-    "version": "1.6.2",
+    "version": "1.6.3",
     "homePage": "https://github.com/serioos/Gallery-Plus-Plus",
     "auto_update": true,
     "minimum_client_version": "1.17.0",
-    "description": "A community fork of SillyTavern Gallery with left/right click image placement, fixed 9:16 portrait tiles, persistent thumbnail caching, and responsive pagination.",
+    "description": "A community fork of SillyTavern Gallery with 9:16 portrait tiles, thumbnail caching, and corrected third-party loading paths.",
     "hooks": {
         "activate": "init"
     }
