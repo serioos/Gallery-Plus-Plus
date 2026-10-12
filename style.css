@@ -1,65 +1,78 @@
-/* Gallery++ Version 1.6.2 — modified from SillyTavern's Gallery extension.
- * SPDX-License-Identifier: AGPL-3.0-or-later */
+/* Gallery++ 2.0 — SPDX-License-Identifier: AGPL-3.0-or-later */
 
-/* Keep the gallery contained inside the usable viewport. The extension also
-   limits nanogallery2 to a safe number of rows so portrait-heavy pages never
-   push the panel underneath the browser/taskbar. */
-#gallery {
+/* ---------------------------------------------------------------- window */
+#gallery.gpp-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    min-width: 0;
+    min-height: 160px;
     max-height: calc(100dvh - 4px);
     box-sizing: border-box;
-    overflow: hidden !important;
-}
-
-#gallery #dragGallery {
-    max-height: calc(82dvh - 180px);
     overflow: hidden;
+    resize: both;
 }
 
-#gallery .nGY2 {
-    max-width: 100%;
-    max-height: 100%;
-    overflow: hidden;
-    contain: layout paint;
+#gallery.gpp-panel.gpp-dropping {
+    outline: 2px dashed var(--SmartThemeQuoteColor);
+    outline-offset: -4px;
 }
 
-#gallery .nGY2GThumbnail {
-    /* The grid has fixed geometry, so off-screen tile contents can be skipped. */
-    content-visibility: auto;
-    contain-intrinsic-size: 144px 256px;
-    contain: layout paint;
+#gallery .dragTitle {
+    margin-right: 30px;
+    gap: 4px;
+    font-weight: 600;
 }
 
-#gallery .nGY2GThumbnailImg {
-    image-rendering: auto;
+#gallery .gpp-title-tag {
+    opacity: 0.6;
+    letter-spacing: 1px;
 }
 
-#gallery .nGY2GalleryBottom {
-    display: none !important;
+/* The window size is computed automatically (tiles scale to the columns x rows and the free space), so the
+   manual resize handle would only fight with it. */
+@media (min-width: 1001px) {
+    #gallery.gpp-panel {
+        resize: none;
+    }
 }
 
-#gallery .gallery-page-button {
-    width: 2.25em;
-    min-width: 2.25em;
-    height: 2.25em;
-    min-height: 2.25em;
-    padding: 0;
-    margin-left: 4px;
-    display: inline-flex;
+/* Full-screen layout: the grid area simply fills the window. */
+@media (max-width: 1000px) {
+    .gpp-scroller {
+        flex: 1 1 auto;
+        height: auto;
+    }
+}
+
+/* Keep the gallery and its pictures behind other SillyTavern UI on desktop. On narrow
+   screens SillyTavern makes draggables full-screen, so they must stay on top there. */
+@media (min-width: 1001px) {
+    #movingDivs > #gallery,
+    #movingDivs > .galleryImageDraggable {
+        z-index: 1 !important;
+    }
+}
+
+/* ---------------------------------------------------------------- toolbars */
+.gpp-row {
+    display: flex;
     align-items: center;
-    justify-content: center;
+    gap: 4px;
     flex: 0 0 auto;
 }
 
-#gallery .gallery-page-button i {
-    margin: 0;
-    font-size: 0.9em;
+.gpp-row-wrap {
+    flex-wrap: wrap;
 }
 
 .gallery-folder-input {
     background-color: transparent;
-    font-size: calc(var(--mainFontSize)* 0.9);
+    font-size: calc(var(--mainFontSize) * 0.9);
     opacity: 0.8;
-    flex-grow: 1;
+    flex: 1 1 auto;
+    min-width: 0;
+    margin: 0;
 }
 
 .gallery-folder-input:placeholder-shown {
@@ -68,14 +81,61 @@
     border-color: transparent;
 }
 
-.gallery-sort-select {
+.gallery-folder-input[readonly] {
+    opacity: 0.55;
+    cursor: default;
+}
+
+.gpp-searchbox {
+    position: relative;
+    flex: 2 1 140px;
+    min-width: 110px;
+    display: flex;
+    align-items: center;
+}
+
+.gpp-search {
     width: 100%;
-    flex: 1;
+    margin: 0;
+    padding-left: 26px;
+    padding-right: 24px;
+    font-size: calc(var(--mainFontSize) * 0.95);
+}
+
+/* hide the browser's own clear button; we draw ours */
+.gpp-search::-webkit-search-cancel-button {
+    display: none;
+}
+
+.gpp-search-icon {
+    position: absolute;
+    left: 8px;
+    opacity: 0.5;
+    font-size: 0.8em;
+    pointer-events: none;
+}
+
+.gpp-clear {
+    position: absolute;
+    right: 7px;
     cursor: pointer;
-    overflow-x: hidden;
+    opacity: 0.6;
+    font-size: 0.85em;
+}
+
+.gpp-clear:hover {
+    opacity: 1;
+}
+
+.gallery-sort-select {
+    flex: 1 1 90px;
+    min-width: 80px;
+    width: auto;
+    cursor: pointer;
+    overflow: hidden;
     white-space: nowrap;
     text-overflow: ellipsis;
-    opacity: 0.8;
+    opacity: 0.85;
     background-color: var(--black30a);
     border: 1px solid var(--SmartThemeBorderColor);
     background-image: url(/img/down-arrow.svg);
@@ -83,31 +143,7 @@
     background-position: right 6px center;
     background-size: 8px 5px;
     padding-right: 20px;
-    margin-bottom: 0;
-}
-
-#gallery .dragTitle {
-    margin-right: 30px;
-}
-
-#dragGallery {
-    min-height: 25dvh;
-}
-
-#gallery .right_menu_button.warning {
-    opacity: 1;
-    filter: unset;
-}
-
-.galleryImageDraggable video {
-    width: 100%;
-}
-
-/* The gallery stays just above the background but behind other SillyTavern UI.
-   This intentionally overrides #movingDivs > div's default high stacking level. */
-#movingDivs > #gallery,
-#movingDivs > .galleryImageDraggable {
-    z-index: 1 !important;
+    margin: 0;
 }
 
 .gallery-side-toggle {
@@ -115,7 +151,6 @@
     min-width: 2.25em;
     padding-left: 0;
     padding-right: 0;
-    margin-left: 4px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -125,3 +160,320 @@
     border-color: var(--active);
 }
 
+#gallery .right_menu_button.warning {
+    opacity: 1;
+    filter: unset;
+    color: var(--warning, #e5534b);
+}
+
+#gallery[hidden],
+#gallery [hidden] {
+    display: none !important;
+}
+
+/* ---------------------------------------------------------------- grid */
+.gpp-scroller {
+    /* Desktop: exactly the size of a full page of tiles (set from JS), so the window never changes
+       size while loading, on a half-empty last page, or when it shows a message. */
+    flex: 0 1 auto;
+    height: var(--gpp-grid-h, auto);
+    min-height: 0;
+    overflow: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    transition: opacity 0.12s;
+}
+
+#gallery.gpp-busy .gpp-scroller {
+    opacity: 0.65;
+}
+
+.gpp-grid {
+    display: grid;
+    grid-template-columns: repeat(var(--gpp-cols, 4), var(--gpp-tw, 140px));
+    grid-auto-rows: var(--gpp-th, 200px);
+    gap: var(--gpp-gap, 6px);
+    padding: var(--gpp-pad, 6px);
+    justify-content: center;
+    align-content: start;
+    width: max-content;
+    min-width: 100%;
+    box-sizing: border-box;
+}
+
+.gpp-grid.gpp-grid-empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: auto;
+    height: 100%;
+}
+
+.gpp-tile {
+    position: relative;
+    width: var(--gpp-tw, 140px);
+    height: var(--gpp-th, 200px);
+    overflow: hidden;
+    border-radius: 4px;
+    background: linear-gradient(315deg, #111 0%, #334 100%);
+    cursor: pointer;
+    /* Tiles have fixed geometry, so layout/paint can be isolated per tile. */
+    contain: strict;
+}
+
+.gpp-tile:hover,
+.gpp-tile:focus-visible {
+    outline: 2px solid var(--SmartThemeQuoteColor);
+    outline-offset: -2px;
+}
+
+.gpp-img {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    opacity: 0;
+    transition: opacity 0.15s;
+    -webkit-user-drag: none;
+    user-select: none;
+}
+
+.gpp-tile.gpp-loaded .gpp-img {
+    opacity: 1;
+}
+
+.gpp-tile.gpp-failed::after {
+    content: '\f03e'; /* image icon */
+    font-family: 'Font Awesome 6 Free', 'Font Awesome 5 Free', sans-serif;
+    font-weight: 900;
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.6em;
+    opacity: 0.3;
+}
+
+.gpp-badge {
+    position: absolute;
+    right: 6px;
+    top: 6px;
+    font-size: 1.2em;
+    color: #fff;
+    text-shadow: 0 0 4px #000;
+    pointer-events: none;
+}
+
+.gpp-name {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    padding: 14px 6px 4px;
+    font-size: 0.72em;
+    line-height: 1.2;
+    color: #fff;
+    background: linear-gradient(transparent, rgba(0, 0, 0, 0.78));
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    opacity: 0;
+    transition: opacity 0.12s;
+    pointer-events: none;
+}
+
+.gpp-tile:hover .gpp-name,
+.gpp-tile:focus-visible .gpp-name,
+.gpp-show-names .gpp-name {
+    opacity: 1;
+}
+
+#gallery.gpp-delete-mode .gpp-tile:hover,
+#gallery.gpp-delete-mode .gpp-tile:focus-visible {
+    outline-color: var(--warning, #e5534b);
+}
+
+#gallery.gpp-delete-mode .gpp-tile {
+    cursor: not-allowed;
+}
+
+.gpp-message {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    padding: 30px 16px;
+    text-align: center;
+    opacity: 0.8;
+}
+
+.gpp-message > i {
+    font-size: 2em;
+    opacity: 0.6;
+}
+
+/* ---------------------------------------------------------------- pager */
+.gpp-pager {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 4px;
+    flex: 0 0 auto;
+    padding-top: 2px;
+}
+
+#gallery .gallery-page-button {
+    width: 2.1em;
+    min-width: 2.1em;
+    height: 2.1em;
+    min-height: 2.1em;
+    padding: 0;
+    margin: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+}
+
+#gallery .gallery-page-button i {
+    margin: 0;
+    font-size: 0.85em;
+}
+
+#gallery .gallery-page-button.disabled {
+    opacity: 0.35;
+    pointer-events: none;
+}
+
+.gpp-page-jump {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    margin: 0 4px;
+}
+
+.gpp-page-input {
+    margin: 0;
+    padding: 3px 4px;
+    text-align: center;
+    min-width: 3ch;
+    font-variant-numeric: tabular-nums;
+}
+
+.gpp-page-total {
+    opacity: 0.8;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+}
+
+.gpp-info {
+    flex: 1 0 100%;
+    text-align: center;
+    font-size: 0.8em;
+    opacity: 0.6;
+    min-height: 1.2em;
+}
+
+/* ---------------------------------------------------------------- opened pictures */
+.galleryImageDraggable img,
+.galleryImageDraggable video {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+}
+
+.galleryImageDraggable.gpp-flash {
+    outline: 2px solid var(--SmartThemeQuoteColor);
+}
+
+/* ---------------------------------------------------------------- Extensions tab */
+.gpp-settings .gpp-settings-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: 8px 12px;
+    margin: 6px 0;
+}
+
+.gpp-field {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.gpp-field-input {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.gpp-number {
+    margin: 0;
+    width: 100%;
+    min-width: 0;
+}
+
+.gpp-range {
+    opacity: 0.5;
+}
+
+.gpp-settings-summary {
+    display: block;
+    margin: 4px 0 8px;
+    opacity: 0.75;
+}
+
+.gpp-settings-buttons {
+    margin-top: 8px;
+    gap: 6px;
+}
+
+/* ---------------------------------------------------------------- folder suggestions */
+.gpp-suggest {
+    position: fixed;
+    z-index: 30000;
+    overflow-y: auto;
+    box-sizing: border-box;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 6px;
+    background: linear-gradient(var(--SmartThemeBlurTintColor), var(--SmartThemeBlurTintColor)), #17171b;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+    scrollbar-width: thin;
+}
+
+.gpp-suggest[hidden] {
+    display: none !important;
+}
+
+.gpp-suggest-item {
+    padding: 5px 9px;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: calc(var(--mainFontSize) * 0.9);
+}
+
+.gpp-suggest-item.gpp-current {
+    font-weight: 600;
+}
+
+.gpp-suggest-item:hover,
+.gpp-suggest-item.gpp-active {
+    background: var(--white30a, rgba(255, 255, 255, 0.2));
+}
+
+/* Opened pictures are sized by script to the space beside the chat; never let them exceed it. */
+.galleryImageDraggable {
+    box-sizing: border-box;
+    overflow: hidden;
+}
+
+.gpp-select {
+    margin: 0;
+    width: 100%;
+    min-width: 0;
+}

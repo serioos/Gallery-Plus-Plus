@@ -1,63 +1,47 @@
-# Gallery++ Extension — Changelog
+# Changelog
 
-## v1.6.2
+## 2.0.4
+- The gallery window now sits flush against the chat panel and the bottom edge of the screen, exactly like opened pictures, and hugs its grid.
+- **No more flash of a small window.** Opened pictures stay invisible until their real size is known (previously a 320x320 placeholder faded in and then jumped to the picture's size). The gallery window itself also appears only once, at its final size.
+- **Tiles now scale with the grid.** Picture size is derived from columns x rows and the free space beside the chat, with no upper cap: few columns/rows give big pictures that fill the window, many give small ones that still fit. The old 1x cap that left small, loose grids is gone.
+- The window keeps the same size while loading, on a half-empty last page, when searching with no results and when showing messages (it used to collapse and re-expand, which looked like a deformed gallery).
+- Thumbnails are generated at the resolution of the tiles actually on screen, so enlarged tiles stay sharp.
+- The shape detected for each gallery is remembered, so reopening it starts at the right size immediately.
+- The manual resize handle is hidden on desktop (the size is automatic).
 
-Performance release. The v1.5.0 feature set and the third-party packaging fix are unchanged.
+## 2.0.3
+- Opened pictures now sit flush against the chat panel and the bottom edge of the screen (like a character sprite).
+- Picture width/height options replaced by a **Picture shape** dropdown (9:21 … 21:9). The default, **Auto**, samples each gallery and uses the shape most of its pictures have.
+- Tile size is derived from the free space beside the chat, so no manual pixel sizes are needed.
+- The "assign folder" check mark now always gives feedback (including "already showing this folder"), matches existing folder names case-insensitively, and ignores double clicks.
 
-### Faster thumbnails
+## 2.0.2
+- Folder dropdown rewritten as a built-in suggestion list: clicking (or arrow keys + Enter) now reliably switches to the chosen gallery.
+- The gallery window and opened pictures are now fitted to the free space beside the chat panel (left or right), never spilling under it. Thumbnails scale down to fit, and everything re-fits when the browser window or chat width changes.
 
-* Gallery tiles now render instantly with a small placeholder; **real thumbnails are generated lazily** as each tile appears instead of blocking the whole page.
-* Image thumbnails are downscaled to compact **WebP (max 256 px)** and stored in a **persistent IndexedDB cache** (`ST_Gallery_Cache`), so folders you've already opened load without refetching the full-size images.
-* Video thumbnails go through the same cache.
-* Added a **bounded in-memory cache** (200 thumbnails) and limited thumbnail decoding to **2 concurrent jobs**, so large or video-heavy folders no longer spike CPU/memory.
-* The cache degrades gracefully: if IndexedDB is unavailable or full, the gallery still works.
+## 2.0.1
+- Fixed "Failed to load the gallery": folder-name autocomplete no longer crashes the window if jQuery UI's autocomplete can't initialise; falls back to a native datalist.
 
-### Layout
+## 2.0.0 — full rewrite
 
-* Tiles are now a fixed **144 × 256 (9:16 portrait)** grid, which avoids album-wide image-size preloading and the partially-populated-page race, so the page-flip re-measure workaround is no longer needed and was removed.
-* Added CSS containment and `content-visibility` on tiles so off-screen tiles are cheap.
-* Disabled the gallery transition animation.
+### New
+- **Gallery++ options** in the Extensions tab: rows, columns, fixed picture width and height (plus file-name captions and a shortcuts toggle).
+- **Name search bar** (multi-word, case-insensitive, `Esc` to clear).
+- **Page navigation**: jump-to-page box, first/last buttons, total page count and item range.
+- **Persistent folder assignments** (immediate save, dedicated settings key, browser recovery copy, automatic migration from the old Gallery settings).
 
-### Smoother interactions
+### Performance
+- Removed the nanogallery2 dependency; custom CSS-grid renderer with only the visible page in the DOM.
+- Lazy thumbnails (IntersectionObserver), WebP IndexedDB cache with size cap and old-cache cleanup, in-memory LRU, bounded and cancellable decode queue.
+- Deleting removes the item locally; uploads/sorting refresh in place.
 
-* **Sorting, uploading, deleting, changing folder, and restoring the folder now refresh in place** instead of closing and re-opening the Gallery++ window.
-* Fixed uploads (including drag-and-drop) targeting a stale folder after the folder had been changed in the open window.
-* Folder suggestions are now loaded **only when you focus the folder box**, so the window opens without waiting on a second request.
-* Gallery assets (nanogallery2 JS/CSS) are **preloaded during browser idle time**; the first click shares that load.
-* Replaced the document-wide `MutationObserver` with an **explicit teardown event**, so SillyTavern's whole DOM is no longer observed for removals.
-* `/list-gallery` now only lists filenames and no longer builds thumbnail items.
-* The "images can also be found in `user/images`" hint now appears only after the gallery loads successfully.
-* Added an error notification when a gallery **refresh** fails.
-
-## v1.5.0
-
-These are the differences with the vanilla 1.5.0 Gallery extension of SillyTavern:
-
-* Fixed gallery **page navigation controls** being pushed below the viewport on 1080p displays.
-* Replaced oversized page flippers with **small left/right buttons beside “Add Image.”**
-* Added **`[` / `]` keyboard shortcuts** for previous/next gallery pages.
-* Added left-click → open image on the left side of the screen.
-* Added right-click → open image on the right side of the screen.
-* `\` — Toggle the gallery panel open/closed.
-* `=` — Close all currently open gallery pictures.
-* Hotkeys only activate when **not typing** in an input field.
-* Fixed the **character gallery-folder dropdown** so selected folders persist and reopen correctly.
-* Fixed **partially loaded gallery pages** after page flips by stabilizing image loading and layout recalculation.
-* Prevented tall/portrait images from **spilling outside the gallery panel** and under the taskbar.
-* Added a **left/right gallery positioning toggle**, with the selected side persisted across SillyTavern restarts.
-* Moved the Gallery panel to a **background-level z-layer** so other UI elements can layer above it.
-* Applied the same **low z-layer behavior to opened gallery images**, including after dragging/focusing them.
-* Optimized gallery performance with **thumbnail caching, bounded loading, folder caching, reduced delays, and improved layout handling**.
-* Improved cleanup and fixed a **mutation-observer teardown leak**.
-* Fixed the **video-extension matching regex**.
-* Fixed file-picker behavior when **selecting the same image again**.
-* Prevented duplicate **Gallery wand buttons** during repeated initialization.
-* Hardened folder restoration when **character data is unavailable**.
-* Added a visible **error notification when gallery loading fails**.
-* Removed minor redundant CSS/code.
-* Renamed the fork to **Gallery++**.
-
-### Packaging fix (same v1.5.0 feature set)
-
-* Corrected the relative import paths for third-party SillyTavern installation.
-* Resolved bundled nanogallery2 assets relative to the installed extension URL instead of assuming a particular folder name.
+### Fixes and improvements
+- Fixed leaked drag-and-drop handlers (replaced by native listeners scoped to the window).
+- Fixed the always-on-bottom z-index forcing the gallery under everything on mobile layouts.
+- Opened pictures use `contain` instead of cropping, are sized to the picture, and are not duplicated if opened twice.
+- The gallery follows character/group changes instead of closing; no more loading an `undefined` folder when nothing is selected.
+- Files with `#`, `?` or `%` in their names now load.
+- One summary toast per upload batch; shows the page containing the new file.
+- `/list-gallery char=` honours the assigned folder.
+- Window is kept inside the viewport after layout changes; stale saved sizes no longer override layout changes.
+- Keyboard-accessible tiles (`Enter`/`Space` = left, `Shift+Enter` = right).

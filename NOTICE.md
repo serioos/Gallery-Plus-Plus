@@ -1,9 +1,8 @@
 # Notice
 
-Gallery++ is a modified version of the Gallery extension included with SillyTavern and originally authored by City-Unit.
+Gallery++ is derived from the Gallery extension included with SillyTavern, originally authored by City-Unit.
+Version 2.0.0 is a from-scratch rewrite that keeps the original's feature set and slash commands.
 
-This package is a community fork prepared for third-party GitHub installation and is released as **Gallery++ Version 1.6.2**.
+The source is distributed under the **GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)**. See `LICENSE`.
 
-The derived source is distributed under the **GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)**. See `LICENSE`.
-
-The bundled `jquery.nanogallery2.min.js` and related nanogallery2 resources are included as third-party dependencies of the original Gallery implementation; retain their upstream notices when redistributing this package.
+Version 2.0.0 no longer bundles nanogallery2 or any other third-party library.

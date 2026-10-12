@@ -1,1657 +1,1517 @@
 /*
- * Gallery++ Version 1.6.2
- * Modified from SillyTavern's Gallery extension, originally authored by City-Unit.
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * Gallery++ 2.0 — a from-scratch rewrite of SillyTavern's Gallery extension.
+ * Original Gallery extension by City-Unit. SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
-import {
-    eventSource,
-    getRequestHeaders,
-    event_types,
-    animation_duration,
-    animation_easing,
-} from '../../../../script.js';
-import { groups, selected_group } from '../../../group-chats.js';
-import { loadFileToDocument, getBase64Async, getSanitizedFilename, saveBase64AsFile, getFileExtension, getVideoThumbnail, clamp } from '../../../utils.js';
+import * as ST from '../../../../script.js';
+import { eventSource, getRequestHeaders, event_types, animation_duration, animation_easing } from '../../../../script.js';
 import { power_user } from '../../../power-user.js';
 import { dragElement } from '../../../RossAscends-mods.js';
+import { getBase64Async, getFileExtension, getSanitizedFilename, saveBase64AsFile } from '../../../utils.js';
 import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
 import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
 import { ARGUMENT_TYPE, SlashCommandNamedArgument } from '../../../slash-commands/SlashCommandArgument.js';
-import { DragAndDropHandler } from '../../../dragdrop.js';
 import { commonEnumProviders } from '../../../slash-commands/SlashCommandCommonEnumsProvider.js';
 import { t, translate } from '../../../i18n.js';
 import { Popup } from '../../../popup.js';
 import { deleteMediaFromServer } from '../../../chats.js';
 import { MEDIA_REQUEST_TYPE, VIDEO_EXTENSIONS } from '../../../constants.js';
 
-const isVideo = (/** @type {string} */ url) => {
-    const lowerUrl = String(url).toLowerCase();
-    return VIDEO_EXTENSIONS.some(ext => {
-        const normalizedExt = String(ext).toLowerCase();
-        return lowerUrl.endsWith(normalizedExt.startsWith('.') ? normalizedExt : `.${normalizedExt}`);
-    });
-};
-// Resolve bundled assets from the actual installed extension URL.
-// This works for both user-scoped and all-users third-party installs, regardless
-// of the repository/folder name SillyTavern chooses for the clone.
-const extensionBaseUrl = new URL('.', import.meta.url);
-const getExtensionAssetUrl = (fileName) => new URL(fileName, extensionBaseUrl).href;
-let galleryWelcomeShown = false;
-let galleryAssetsPromise = null;
-let deleteModeActive = false;
-let galleryRequestToken = 0;
-let galleryInitialized = false;
-let galleryFoldersCache = null;
-let galleryFoldersCacheTime = 0;
-const galleryThumbnailMemoryCache = new Map();
-const galleryThumbnailJobQueue = [];
-let activeGalleryThumbnailJobs = 0;
-const GALLERY_THUMBNAIL_CONCURRENCY = 2;
-const GALLERY_THUMBNAIL_MAX_SIDE = 256;
-const GALLERY_THUMBNAIL_MEMORY_LIMIT = 200;
-const GALLERY_FOLDERS_CACHE_TTL = 15_000;
-const GALLERY_CACHE_DB_NAME = 'ST_Gallery_Cache';
-const GALLERY_CACHE_DB_VERSION = 1;
-const GALLERY_CACHE_STORE_NAME = 'thumbnails';
-let galleryDBPromise = null;
-const IMAGE_PLACEHOLDER = makeGalleryPlaceholder('image');
-const VIDEO_PLACEHOLDER = makeGalleryPlaceholder('video');
-const DEFAULT_GALLERY_SIDE = 'left';
-const GALLERY_BACK_Z_INDEX = '1';
+import {
+    ASPECT_PRESETS, LAYOUT_DEFAULTS, LAYOUT_LIMITS, baseName, clampInt, clampPage, dominantAspect, encodePath,
+    filterByName, fitTile, isVideoName, pageCount, pageForIndex, pageSlice, parseAspect, parsePageInput, sanitizeHTMLId,
+    thumbBucket,
+} from './lib.js';
+import {
+    configureSettings, getBoolean, getLayout, getSettings, getSide, getSort, removeAvatar, renameAvatar,
+    resetLayout, resolveCharacterFolder, setBoolean, setFolderOverride, setLayout, setSide, setSort,
+    getFolderOverride,
+} from './settings.js';
+import { clearThumbnailCache, getThumbnail, peekThumbnail, purgeThumbnail } from './thumbs.js';
 
+// ------------------------------------------------------------------------------- constants
 
-const CUSTOM_GALLERY_REMOVED_EVENT = 'galleryRemoved';
+const PANEL_ID = 'gallery'; // same id as the original extension, so the saved window position carries over
+const GRID_GAP = 6;
+const GRID_PADDING = 6;
+const DEFAULT_TILE_SIDE = 300; // only used to size thumbnails before the first fit has run
+const REVEAL_TIMEOUT_MS = 900; // longest a new gallery window waits (hidden) for its final shape
+const ASPECT_HINTS_KEY = 'gpp_aspect_hints'; // folder -> detected tile ratio, so reopening is instant
+const DEFAULT_RATIO = 2 / 3; // used until a gallery's dominant shape is known
+const ASPECT_SAMPLES = 18; // pictures sampled to find a gallery's dominant shape
+const MOBILE_BREAKPOINT = 1000;
+const SEARCH_DEBOUNCE_MS = 120;
+const FOLDERS_CACHE_TTL = 15_000;
 
-/**
- * Emits the gallery teardown event and removes the outer panel. Keeping this
- * explicit avoids observing SillyTavern's entire document subtree for removals.
- */
-function removeGalleryPanel() {
-    const panel = $('#movingDivs > #gallery');
-    if (!panel.length) return;
-    eventSource.emit(CUSTOM_GALLERY_REMOVED_EVENT);
-    panel.remove();
-}
+const SORTS = Object.freeze([
+    { value: 'nameAsc', field: 'name', order: 'asc', label: t`Name (A-Z)` },
+    { value: 'nameDesc', field: 'name', order: 'desc', label: t`Name (Z-A)` },
+    { value: 'dateDesc', field: 'date', order: 'desc', label: t`Newest` },
+    { value: 'dateAsc', field: 'date', order: 'asc', label: t`Oldest` },
+]);
 
-// Remove draggable windows through the normal animated close path.
-$('#movingDivs').on('click', '.dragClose', function () {
-    const relatedId = $(this).data('related-id');
-    if (!relatedId) return;
-    const relatedElement = $(`#movingDivs > .draggable[id="${relatedId}"]`);
-    relatedElement.transition({
-        opacity: 0,
-        duration: animation_duration,
-        easing: animation_easing,
-        complete: () => {
-            if (relatedId === 'gallery') {
-                eventSource.emit(CUSTOM_GALLERY_REMOVED_EVENT);
-            }
-            relatedElement.remove();
-        },
-    });
-});
+// ------------------------------------------------------------------------------- small helpers
 
-const SORT = Object.freeze({
-    NAME_ASC: { value: 'nameAsc', field: 'name', order: 'asc', label: t`Name (A-Z)` },
-    NAME_DESC: { value: 'nameDesc', field: 'name', order: 'desc', label: t`Name (Z-A)` },
-    DATE_DESC: { value: 'dateDesc', field: 'date', order: 'desc', label: t`Newest` },
-    DATE_ASC: { value: 'dateAsc', field: 'date', order: 'asc', label: t`Oldest` },
-});
-
-const defaultSettings = Object.freeze({
-    folders: {},
-    sort: SORT.DATE_ASC.value,
-    side: DEFAULT_GALLERY_SIDE,
-});
-
-/**
- * Initializes the settings for the gallery extension.
- */
-function initSettings() {
-    let shouldSave = false;
-    const context = SillyTavern.getContext();
-    if (!context.extensionSettings.gallery) {
-        context.extensionSettings.gallery = structuredClone(defaultSettings);
-        shouldSave = true;
+/** Tiny DOM builder. `on*` keys become listeners; `class`, `dataset` and a few props are handled. */
+function h(tag, attrs = {}, ...children) {
+    const el = document.createElement(tag);
+    for (const [key, value] of Object.entries(attrs ?? {})) {
+        if (value === undefined || value === null || value === false) continue;
+        if (key === 'class') el.className = value;
+        else if (key === 'dataset') Object.assign(el.dataset, value);
+        else if (key.startsWith('on') && typeof value === 'function') el.addEventListener(key.slice(2).toLowerCase(), value);
+        else if (key === 'value' || key === 'checked' || key === 'disabled' || key === 'readOnly') el[key] = value;
+        else el.setAttribute(key, value === true ? '' : String(value));
     }
-    for (const key of Object.keys(defaultSettings)) {
-        if (!Object.hasOwn(context.extensionSettings.gallery, key)) {
-            context.extensionSettings.gallery[key] = structuredClone(defaultSettings[key]);
-            shouldSave = true;
-        }
+    for (const child of children.flat()) {
+        if (child === undefined || child === null || child === false) continue;
+        el.append(child);
     }
-    if (shouldSave) {
-        context.saveSettingsDebounced();
-    }
+    return el;
 }
 
-/**
- * Retrieves the gallery folder for a given character.
- * The current SillyTavern context is the source of truth for character data;
- * this avoids stale imported character-array references after character changes.
- * @param {Character} char Character data
- * @returns {string} The gallery folder for the character
- */
-function getGalleryFolder(char) {
-    const context = SillyTavern.getContext();
-    const folders = context.extensionSettings.gallery?.folders ?? {};
-    return folders[char?.avatar] ?? char?.name;
+const icon = (classes) => h('i', { class: classes, 'aria-hidden': 'true' });
+
+function debounce(fn, ms) {
+    let timer = 0;
+    const wrapped = (...args) => {
+        clearTimeout(timer);
+        timer = setTimeout(() => fn(...args), ms);
+    };
+    wrapped.cancel = () => clearTimeout(timer);
+    return wrapped;
 }
 
-/**
- * Returns the currently selected single character, or null for groups/no character.
- * @returns {Character|null}
- */
-function getCurrentGalleryCharacter() {
-    const context = SillyTavern.getContext();
-    if (context.groupId || context.characterId === undefined || context.characterId === null) {
-        return null;
-    }
-    return context.characters?.[context.characterId] ?? null;
-}
+const isMobileLayout = () => window.innerWidth <= MOBILE_BREAKPOINT;
 
-/**
- * Gets the persisted gallery side. Invalid/legacy values fall back to the left side.
- * @returns {'left'|'right'} The configured side
- */
-function getGallerySide() {
-    const side = SillyTavern.getContext().extensionSettings.gallery.side;
-    return side === 'right' ? 'right' : DEFAULT_GALLERY_SIDE;
-}
-
-/**
- * Persists the gallery side toggle state.
- * @param {'left'|'right'} side The new side
- */
-function setGallerySide(side) {
-    const context = SillyTavern.getContext();
-    context.extensionSettings.gallery.side = side === 'right' ? 'right' : DEFAULT_GALLERY_SIDE;
-    context.saveSettingsDebounced();
-}
-
-/**
- * Creates a tiny SVG data URI used until a real image/video thumbnail is ready.
- * @param {'image'|'video'} kind Placeholder type
- * @returns {string} SVG data URI
- */
-function makeGalleryPlaceholder(kind) {
-    // Match the gallery's fixed 9:16 portrait tile ratio to avoid square placeholders
-    // stretching or leaving inconsistent empty space while thumbnails are generated.
-    const symbol = kind === 'video'
-        ? '<path d="M3.2 5.2v5.6L7.1 8z" fill="#eee"/>'
-        : '<path d="M1.2 13.2 3.4 9.6l2.1 2.3 1.2-1.5 1.1 2.8H1.2zm1.9-5.5a.9.9 0 1 0 0-1.8.9.9 0 0 0 0 1.8z" fill="#ddd"/>';
-    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="144" height="256" viewBox="0 0 9 16"><rect width="9" height="16" fill="#222"/>${symbol}</svg>`;
-    return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
-}
-
-/**
- * Loads the thumbnail database once per extension runtime. IDB errors are
- * tolerated so gallery browsing continues if storage is disabled or full.
- * @returns {Promise<IDBDatabase>}
- */
-function openGalleryDB() {
-    if (!('indexedDB' in window)) {
-        return Promise.reject(new Error('IndexedDB is unavailable'));
-    }
-    if (!galleryDBPromise) {
-        galleryDBPromise = new Promise((resolve, reject) => {
-            const request = indexedDB.open(GALLERY_CACHE_DB_NAME, GALLERY_CACHE_DB_VERSION);
-            request.onupgradeneeded = () => {
-                const db = request.result;
-                if (!db.objectStoreNames.contains(GALLERY_CACHE_STORE_NAME)) {
-                    db.createObjectStore(GALLERY_CACHE_STORE_NAME);
-                }
-            };
-            request.onsuccess = () => {
-                const db = request.result;
-                db.onversionchange = () => {
-                    db.close();
-                    galleryDBPromise = null;
-                };
-                resolve(db);
-            };
-            request.onerror = () => reject(request.error ?? new Error('Failed to open thumbnail cache'));
-            request.onblocked = () => reject(new Error('Thumbnail cache upgrade was blocked'));
-        }).catch(error => {
-            galleryDBPromise = null;
-            throw error;
-        });
-    }
-    return galleryDBPromise;
-}
-
-function rememberGalleryThumbnail(key, value) {
-    galleryThumbnailMemoryCache.delete(key);
-    galleryThumbnailMemoryCache.set(key, value);
-    while (galleryThumbnailMemoryCache.size > GALLERY_THUMBNAIL_MEMORY_LIMIT) {
-        const oldestKey = galleryThumbnailMemoryCache.keys().next().value;
-        galleryThumbnailMemoryCache.delete(oldestKey);
-    }
-}
-
-/** @param {string} key @returns {Promise<string|null>} */
-async function getCachedThumbnail(key) {
-    const memoryValue = galleryThumbnailMemoryCache.get(key);
-    if (memoryValue) {
-        // Refresh insertion order to keep frequently used thumbnails in memory.
-        rememberGalleryThumbnail(key, memoryValue);
-        return memoryValue;
-    }
-
-    try {
-        const db = await openGalleryDB();
-        const value = await new Promise((resolve, reject) => {
-            const tx = db.transaction(GALLERY_CACHE_STORE_NAME, 'readonly');
-            const request = tx.objectStore(GALLERY_CACHE_STORE_NAME).get(key);
-            request.onsuccess = () => resolve(request.result || null);
-            request.onerror = () => reject(request.error);
-            tx.onerror = () => reject(tx.error);
-        });
-        if (typeof value === 'string' && value) {
-            rememberGalleryThumbnail(key, value);
-            return value;
-        }
-        if (value instanceof Blob) {
-            const dataUrl = await blobToDataUrl(value);
-            rememberGalleryThumbnail(key, dataUrl);
-            return dataUrl;
-        }
-        return null;
-    } catch (error) {
-        console.debug('Gallery thumbnail cache read skipped:', error);
-        return null;
-    }
-}
-
-/** @param {string} key @param {string|Blob} value @returns {Promise<string>} displayable data URL */
-async function setCachedThumbnail(key, value) {
-    // Store image thumbnails as compact Blobs in IndexedDB while retaining a
-    // ready-to-apply data URL in the bounded in-memory cache.
-    const displayUrl = typeof value === 'string' ? value : await blobToDataUrl(value);
-    rememberGalleryThumbnail(key, displayUrl);
-    try {
-        const db = await openGalleryDB();
-        await new Promise((resolve, reject) => {
-            const tx = db.transaction(GALLERY_CACHE_STORE_NAME, 'readwrite');
-            tx.objectStore(GALLERY_CACHE_STORE_NAME).put(value, key);
-            tx.oncomplete = resolve;
-            tx.onerror = () => reject(tx.error);
-            tx.onabort = () => reject(tx.error ?? new Error('Thumbnail cache write aborted'));
-        });
-    } catch (error) {
-        console.warn('Failed to persist gallery thumbnail:', error);
-    }
-    return displayUrl;
-}
-
-/**
- * Limits expensive canvas/video decode work to a small number of concurrent
- * jobs. The jobs themselves are enqueued only for thumbnails instantiated by
- * nanogallery2 on the active page.
- * @template T
- * @param {() => Promise<T>} task
- * @returns {Promise<T>}
- */
-function enqueueGalleryThumbnailJob(task) {
-    return new Promise((resolve, reject) => {
-        galleryThumbnailJobQueue.push({ task, resolve, reject });
-        runNextGalleryThumbnailJobs();
-    });
-}
-
-function runNextGalleryThumbnailJobs() {
-    while (activeGalleryThumbnailJobs < GALLERY_THUMBNAIL_CONCURRENCY && galleryThumbnailJobQueue.length > 0) {
-        const job = galleryThumbnailJobQueue.shift();
-        activeGalleryThumbnailJobs++;
-        Promise.resolve()
-            .then(job.task)
-            .then(job.resolve, job.reject)
-            .finally(() => {
-                activeGalleryThumbnailJobs--;
-                runNextGalleryThumbnailJobs();
-            });
-    }
-}
-
-/** @param {Blob} blob @returns {Promise<string>} */
-function blobToDataUrl(blob) {
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => typeof reader.result === 'string'
-            ? resolve(reader.result)
-            : reject(new Error('Could not encode gallery thumbnail'));
-        reader.onerror = () => reject(reader.error ?? new Error('Could not encode gallery thumbnail'));
-        reader.readAsDataURL(blob);
-    });
-}
-
-/**
- * Creates a compact WebP thumbnail on demand. The full image is fetched only
- * after its tile is instantiated; all later views use the persistent cache.
- * @param {string} src
- * @returns {Promise<string|null>}
- */
-async function createImageGalleryThumbnail(src) {
-    const cacheKey = `image:${src}`;
-    const cached = await getCachedThumbnail(cacheKey);
-    if (cached) return cached;
-
-    const response = await fetch(src, { credentials: 'same-origin' });
-    if (!response.ok) throw new Error(`HTTP ${response.status} while loading gallery image`);
-    const originalBlob = await response.blob();
-    let imageSource;
-    let cleanupSource = () => {};
-
-    if (typeof createImageBitmap === 'function') {
-        imageSource = await createImageBitmap(originalBlob);
-        cleanupSource = () => imageSource?.close?.();
+function fadeRemove(element, onDone) {
+    const $el = $(element);
+    const finish = () => { element.remove(); onDone?.(); };
+    if (typeof $el.transition === 'function') {
+        $el.transition({ opacity: 0, duration: animation_duration, easing: animation_easing, complete: finish });
     } else {
-        const objectUrl = URL.createObjectURL(originalBlob);
-        const image = new Image();
-        image.decoding = 'async';
-        image.src = objectUrl;
-        try {
-            await image.decode();
-        } catch (error) {
-            URL.revokeObjectURL(objectUrl);
-            throw error;
-        }
-        imageSource = image;
-        cleanupSource = () => URL.revokeObjectURL(objectUrl);
-    }
-
-    try {
-        const width = imageSource.width ?? imageSource.naturalWidth;
-        const height = imageSource.height ?? imageSource.naturalHeight;
-        if (!width || !height) return null;
-        const scale = Math.min(1, GALLERY_THUMBNAIL_MAX_SIDE / Math.max(width, height));
-        const targetWidth = Math.max(1, Math.round(width * scale));
-        const targetHeight = Math.max(1, Math.round(height * scale));
-        const canvas = typeof OffscreenCanvas === 'function'
-            ? new OffscreenCanvas(targetWidth, targetHeight)
-            : Object.assign(document.createElement('canvas'), { width: targetWidth, height: targetHeight });
-        const context = canvas.getContext('2d');
-        if (!context) throw new Error('Canvas 2D context unavailable');
-        context.drawImage(imageSource, 0, 0, targetWidth, targetHeight);
-
-        let thumbnailBlob;
-        if (typeof canvas.convertToBlob === 'function') {
-            thumbnailBlob = await canvas.convertToBlob({ type: 'image/webp', quality: 0.82 });
-        } else if (typeof canvas.toBlob === 'function') {
-            thumbnailBlob = await new Promise((resolve, reject) => {
-                canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('WebP thumbnail encoding failed')), 'image/webp', 0.82);
-            });
-        } else {
-            const dataUrl = canvas.toDataURL('image/webp', 0.82);
-            await setCachedThumbnail(cacheKey, dataUrl);
-            return dataUrl;
-        }
-
-        // Persist the compact Blob; the helper also creates an in-memory data URL.
-        return await setCachedThumbnail(cacheKey, thumbnailBlob);
-    } finally {
-        cleanupSource();
+        finish();
     }
 }
 
-/**
- * Resolves the thumbnail for a rendered tile and updates nanogallery2's visible
- * background and its hidden image element together. This prevents the original
- * full-resolution URL from being requested as the thumbnail source.
- * @param {JQuery<HTMLElement>} $thumbnail
- * @param {{src: string, isVideo?: boolean}} item
- */
-function loadGalleryThumbnail($thumbnail, item) {
-    if (!item?.src) return;
-    const thumbnailElement = $thumbnail[0];
-    const src = item.src;
-    // Fall back to the URL extension in case nanogallery2 drops custom fields.
-    const video = Boolean(item.isVideo || isVideo(src));
-    const cacheKey = `${video ? 'video' : 'image'}:${src}`;
-    $thumbnail.find('.nGY2TnImg2')
-        .attr('loading', 'lazy')
-        .attr('decoding', 'async');
-
-    const applyThumbnail = (thumbnailUrl) => {
-        if (!thumbnailUrl || !thumbnailElement?.isConnected) return;
-        if (thumbnailElement.getAttribute('data-gallery-src') !== src) return;
-        $thumbnail.find('.nGY2TnImg').css('background-image', `url("${thumbnailUrl}")`);
-        $thumbnail.find('.nGY2TnImg2')
-            .attr('loading', 'lazy')
-            .attr('decoding', 'async')
-            .attr('src', thumbnailUrl);
-    };
-
-    void (async () => {
-        const cached = await getCachedThumbnail(cacheKey);
-        if (cached) {
-            applyThumbnail(cached);
-            return;
-        }
-        try {
-            const thumbnail = await enqueueGalleryThumbnailJob(async () => {
-                if (!thumbnailElement?.isConnected) return null;
-                const justCached = await getCachedThumbnail(cacheKey);
-                if (justCached) return justCached;
-                if (video) {
-                    const generated = await getVideoThumbnail(src, GALLERY_THUMBNAIL_MAX_SIDE, GALLERY_THUMBNAIL_MAX_SIDE);
-                    if (generated) await setCachedThumbnail(cacheKey, generated);
-                    return generated;
-                }
-                return await createImageGalleryThumbnail(src);
-            });
-            applyThumbnail(thumbnail);
-        } catch (error) {
-            console.debug(`Failed to generate thumbnail for ${src}:`, error);
-        }
-    })();
-}
-
-/** Loads the gallery JS/CSS once; idle preloading and first-open share a promise. */
-function loadGalleryAssets() {
-    if (!galleryAssetsPromise) {
-        galleryAssetsPromise = Promise.all([
-            loadFileToDocument(getExtensionAssetUrl('nanogallery2.woff.min.css'), 'css'),
-            loadFileToDocument(getExtensionAssetUrl('jquery.nanogallery2.min.js'), 'js'),
-        ]).catch(error => {
-            galleryAssetsPromise = null;
-            throw error;
-        });
-    }
-    return galleryAssetsPromise;
-}
-
-/**
- * Calculates a safe number of thumbnail rows for the usable viewport.
- * With deterministic square tiles the gallery can size pages without waiting
- * for image dimensions, while reserving room for the controls and taskbar.
- * @param {number} thumbnailHeight
- * @returns {number}
- */
-function getGalleryMaxRows(thumbnailHeight) {
-    const viewportHeight = Math.max(360, Math.floor(window.visualViewport?.height ?? window.innerHeight));
-    const usableHeight = Math.max(thumbnailHeight, Math.floor(viewportHeight * 0.82 - 220));
-    return clamp(Math.floor(usableHeight / thumbnailHeight), 1, 8);
-}
-
-/**
- * Loads only one element's Moving UI state instead of reloading every movable
- * panel in SillyTavern.
- * @param {JQuery<HTMLElement>} element The draggable element
- */
-function loadMovingUIElementState(element) {
-    const id = element.attr('id');
-    const state = id ? power_user?.movingUIState?.[id] : null;
-    if (state && typeof state === 'object') {
-        element.css(state);
+function fadeIn(element) {
+    const $el = $(element);
+    if (typeof $el.transition === 'function') {
+        $el.transition({ opacity: 1, duration: animation_duration, easing: animation_easing });
+    } else {
+        element.style.opacity = '1';
     }
 }
 
+// ------------------------------------------------------------------------------- state
+
 /**
- * Mirrors an element horizontally within the viewport.
- * @param {JQuery<HTMLElement>} element The draggable element
+ * @typedef {{path: string, url: string, name: string, nameLower: string, video: boolean}} GalleryItem
+ * @typedef {{el: HTMLElement, img: HTMLImageElement, item: GalleryItem, objectUrl: string|null}} Tile
  */
-function mirrorElementHorizontally(element) {
-    const node = element[0];
-    if (!(node instanceof HTMLElement)) return;
 
-    const rect = node.getBoundingClientRect();
-    const maxLeft = Math.max(0, window.innerWidth - rect.width);
-    const mirroredLeft = clamp(window.innerWidth - rect.right, 0, maxLeft);
+const view = {
+    /** @type {HTMLElement|null} */ panel: null,
+    /** @type {Record<string, any>} */ refs: {},
+    token: 0,
+    /** @type {AbortController|null} */ loadCtl: null,
+    /** @type {AbortController|null} */ renderCtl: null,
+    /** @type {IntersectionObserver|null} */ observer: null,
+    kind: /** @type {'char'|'group'} */ ('char'),
+    folder: '',
+    /** @type {GalleryItem[]} */ items: [],
+    /** @type {GalleryItem[]} */ filtered: [],
+    query: '',
+    page: 1,
+    pageSize: 1,
+    /** @type {Map<HTMLElement, Tile>} */ tiles: new Map(),
+    status: /** @type {'loading'|'ready'|'error'} */ ('loading'),
+    deleteMode: false,
+    uploading: false,
+    /** @type {{tw: number, th: number}|null} */ fit: null,
+    /** Thumbnail bucket the tiles on screen were rendered with. */
+    renderedBucket: 0,
+    rendering: false,
+    revealed: false,
+    /** Width/height detected for the open gallery (used when the shape option is 'auto'). */
+    /** @type {number|null} */ autoRatio: null,
+};
 
-    element.css({
-        left: `${mirroredLeft}px`,
-        right: 'auto',
-        margin: 'unset',
-    });
+let initialized = false;
+let foldersCache = { time: 0, list: /** @type {string[]|null} */ (null) };
+const sanitizedCache = new Map();
+
+// ------------------------------------------------------------------------------- data access
+
+async function sanitizeFolder(name) {
+    const key = String(name);
+    if (!sanitizedCache.has(key)) sanitizedCache.set(key, await getSanitizedFilename(key));
+    return sanitizedCache.get(key);
 }
 
-/**
- * Places an element on the configured side without disturbing its vertical
- * position or user-defined size. If the element is already on the correct side,
- * its exact saved position is preserved.
- * @param {JQuery<HTMLElement>} element The draggable element
- * @param {'left'|'right'} side Desired side
- */
-function ensureElementOnGallerySide(element, side) {
-    const node = element[0];
-    if (!(node instanceof HTMLElement) || node.offsetWidth <= 0) return;
-
-    const rect = node.getBoundingClientRect();
-    const centerX = rect.left + (rect.width / 2);
-    const isOnRight = centerX > window.innerWidth / 2;
-
-    if ((side === 'right') !== isOnRight) {
-        mirrorElementHorizontally(element);
+/** @returns {{kind: 'char'|'group', folder: string, character: any}|null} */
+function getTarget() {
+    const ctx = SillyTavern.getContext();
+    if (ctx.groupId) return { kind: 'group', folder: String(ctx.groupId), character: null };
+    if (ctx.characterId !== undefined && ctx.characterId !== null) {
+        const character = ctx.characters?.[ctx.characterId];
+        if (character) return { kind: 'char', folder: resolveCharacterFolder(character) ?? character.name, character };
     }
+    return null;
 }
 
-/**
- * Applies the gallery side to the panel and every currently-opened image
- * window. Each window is mirrored independently, preserving its layout.
- * @param {boolean} forceMirror Whether to mirror even if an element is already
- * on the target side
- */
-function applyGalleryBackLayer(element) {
-    const node = element?.[0];
-    if (!(node instanceof HTMLElement)) return;
-
-    // Gallery windows deliberately live in the same low stacking layer as the
-    // gallery panel. SillyTavern's draggable helper may raise a window when it
-    // receives focus/drag events, so use !important here and re-apply it on the
-    // next frame after those events.
-    node.style.setProperty('z-index', GALLERY_BACK_Z_INDEX, 'important');
-}
-
-function applyGallerySideToOpenWindows(forceMirror = false) {
-    const side = getGallerySide();
-    const elements = $('#gallery, .galleryImageDraggable');
-
-    elements.each(function () {
-        const element = $(this);
-        applyGalleryBackLayer(element);
-        if (forceMirror) {
-            mirrorElementHorizontally(element);
-        } else {
-            ensureElementOnGallerySide(element, side);
-        }
-    });
-}
-
-function keepGalleryWindowOnBackLayer(element) {
-    applyGalleryBackLayer(element);
-    const node = element?.[0];
-    if (!(node instanceof HTMLElement)) return;
-
-    const restoreBackLayer = () => {
-        applyGalleryBackLayer(element);
-        requestAnimationFrame(() => applyGalleryBackLayer(element));
-    };
-
-    node.addEventListener('pointerdown', restoreBackLayer, true);
-    node.addEventListener('mousedown', restoreBackLayer, true);
-    node.addEventListener('touchstart', restoreBackLayer, { capture: true, passive: true });
-    node.addEventListener('focusin', restoreBackLayer, true);
-}
-
-/**
- * Refreshes all gallery windows after changing a gallery-side toggle.
- */
-function toggleGallerySide() {
-    const nextSide = getGallerySide() === 'right' ? 'left' : 'right';
-    setGallerySide(nextSide);
-    applyGallerySideToOpenWindows(true);
-}
-
-/**
- * Fetches the raw filenames from the server, without creating UI items or
- * generating any thumbnails. Shared by the gallery and /list-gallery command.
- * @param {string} url Gallery folder
- * @returns {Promise<string[]>}
- */
-async function fetchImageFileList(url) {
-    const sortValue = getSortOrder();
-    const sortObj = Object.values(SORT).find(it => it.value === sortValue) ?? SORT.DATE_ASC;
+async function listFolderFiles(folder, signal) {
+    const sort = SORTS.find(s => s.value === getSort()) ?? SORTS[3];
     const response = await fetch('/api/images/list', {
         method: 'POST',
         headers: getRequestHeaders(),
+        signal,
         body: JSON.stringify({
-            folder: url,
-            sortField: sortObj.field,
-            sortOrder: sortObj.order,
+            folder,
+            sortField: sort.field,
+            sortOrder: sort.order,
             type: MEDIA_REQUEST_TYPE.IMAGE | MEDIA_REQUEST_TYPE.VIDEO,
         }),
     });
-
-    if (!response.ok) {
-        throw new Error(`Failed to list gallery images. HTTP ${response.status}`);
-    }
+    if (!response.ok) throw new Error(`HTTP ${response.status} while listing the gallery`);
     const data = await response.json();
-    if (!Array.isArray(data)) {
-        throw new Error('Gallery image list response was not an array');
-    }
+    if (!Array.isArray(data)) throw new Error('Unexpected gallery list response');
     return data;
 }
 
-/**
- * Converts file names into lightweight gallery items immediately. Real image
- * and video thumbnails are fetched/decoded lazily by fnThumbnailInit.
- * @param {string} url Gallery folder
- * @returns {Promise<Array<{src: string, srct: string, title: string, isVideo: boolean}>>}
- */
-async function getGalleryItems(url) {
-    const [files, sanitizedUrl] = await Promise.all([
-        fetchImageFileList(url),
-        getSanitizedFilename(url),
-    ]);
-
+/** @returns {Promise<GalleryItem[]>} */
+async function fetchItems(folder, signal) {
+    const [files, safe] = await Promise.all([listFolderFiles(folder, signal), sanitizeFolder(folder)]);
     return files.map(file => {
-        const src = `user/images/${sanitizedUrl}/${file}`;
-        const video = isVideo(file);
-        return {
-            src,
-            // Only a small inline SVG is initially loaded by nanogallery2.
-            srct: video ? VIDEO_PLACEHOLDER : IMAGE_PLACEHOLDER,
-            title: '',
-            isVideo: video,
-        };
+        const name = String(file);
+        const path = `user/images/${safe}/${name}`;
+        return { path, url: encodePath(path), name, nameLower: name.toLowerCase(), video: isVideoName(name, VIDEO_EXTENSIONS) };
     });
 }
 
-/**
- * Retrieves a list of gallery folders. This function calls an API endpoint
- * @returns {Promise<string[]>} - Resolves with an array of gallery folders.
- */
-async function getGalleryFolders() {
+async function getAllFolders() {
     const now = Date.now();
-    if (Array.isArray(galleryFoldersCache) && now - galleryFoldersCacheTime < GALLERY_FOLDERS_CACHE_TTL) {
-        return galleryFoldersCache;
-    }
-
+    if (foldersCache.list && now - foldersCache.time < FOLDERS_CACHE_TTL) return foldersCache.list;
     try {
-        const response = await fetch('/api/images/folders', {
-            method: 'POST',
-            headers: getRequestHeaders({ omitContentType: true }),
-        });
-
-        if (!response.ok) {
-            throw new Error(`HTTP error. Status: ${response.status}`);
-        }
+        const response = await fetch('/api/images/folders', { method: 'POST', headers: getRequestHeaders({ omitContentType: true }) });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json();
-        galleryFoldersCache = Array.isArray(data) ? data : [];
-        galleryFoldersCacheTime = now;
-        return galleryFoldersCache;
+        foldersCache = { time: now, list: Array.isArray(data) ? data : [] };
     } catch (error) {
-        console.error('Failed to fetch gallery folders:', error);
+        console.error('[Gallery++] Failed to fetch folders:', error);
+        foldersCache = { time: 0, list: null };
         return [];
     }
+    return foldersCache.list ?? [];
+}
+
+// ------------------------------------------------------------------------------- loading + filtering
+
+function applyFilter() {
+    view.filtered = filterByName(view.items, view.query);
+}
+
+/** Fades the gallery window in. Called once it has its final size, so it never visibly resizes. */
+function revealPanel() {
+    const panel = view.panel;
+    if (!panel || view.revealed) return;
+    view.revealed = true;
+    fadeIn(panel);
 }
 
 /**
- * Deletes a gallery item based on the provided URL.
- * @param {string} url - The URL of the image to be deleted.
+ * Loads the current folder in place; the panel stays mounted.
+ * @param {{keepPage?: boolean, previousPaths?: Set<string>}} [options]
  */
-async function deleteGalleryItem(url) {
-    const isDeleted = await deleteMediaFromServer(url, false);
-    if (isDeleted) {
-        toastr.success(t`Image deleted successfully.`);
-    }
-}
-
-/**
- * Sets the sort order for the gallery.
- * @param {string} order Sort order
- */
-function setSortOrder(order) {
-    const context = SillyTavern.getContext();
-    context.extensionSettings.gallery.sort = order;
-    context.saveSettingsDebounced();
-}
-
-/**
- * Retrieves the current sort order for the gallery.
- * @returns {string} The current sort order for the gallery.
- */
-function getSortOrder() {
-    return SillyTavern.getContext().extensionSettings.gallery.sort ?? defaultSettings.sort;
-}
-
-/**
- * Initializes a gallery using the provided items and sets up the drag-and-drop functionality.
- * It uses the nanogallery2 library to display the items and also initializes
- * event listeners to handle drag-and-drop of files onto the gallery.
- *
- * @param {Array<Object>} items - An array of objects representing the items to display in the gallery.
- * @param {string} url - The URL to use when a file is dropped onto the gallery for uploading.
- * @returns {Promise<void>} - Promise representing the completion of the gallery initialization.
- */
-async function initGallery(items, url) {
-    // Fixed geometry selects the GRID engine and avoids album-wide image-size preloads.
-    // 144 × 256 is an exact 9:16 portrait ratio while remaining a compact grid tile.
-    const thumbnailWidth = 144;
-    const thumbnailHeight = 256;
-    const paginationVisiblePages = 5;
-    const paginationMaxLinesPerPage = 2;
-    const galleryMaxRows = getGalleryMaxRows(thumbnailHeight);
-
-    const nonce = `nonce-${Math.random().toString(36).substring(2, 15)}`;
-    const gallery = $('#dragGallery');
-    gallery.addClass(nonce);
-    gallery.nanogallery2({
-        'items': items,
-        thumbnailWidth: thumbnailWidth,
-        thumbnailHeight: thumbnailHeight,
-        thumbnailAlignment: 'fillWidth',
-        thumbnailWaitImageLoaded: false,
-        galleryDisplayTransition: 'none',
-        paginationVisiblePages: paginationVisiblePages,
-        paginationMaxLinesPerPage: paginationMaxLinesPerPage,
-        galleryMaxRows: galleryMaxRows,
-        // The extension provides compact page buttons beside Add Image.
-        // Do not create nanogallery2's large top navigation controls.
-        galleryPaginationTopButtons: false,
-        galleryNavigationOverlayButtons: false,
-        galleryPaginationMode: 'rectangles',
-        galleryTheme: {
-            navigationBar: { background: 'none', borderTop: '', borderBottom: '', borderRight: '', borderLeft: '' },
-            navigationBreadcrumb: { background: '#111', color: '#fff', colorHover: '#ccc', borderRadius: '4px' },
-            navigationFilter: { color: '#ddd', background: '#111', colorSelected: '#fff', backgroundSelected: '#111', borderRadius: '4px' },
-            navigationPagination: { background: '#111', color: '#fff', colorHover: '#ccc', borderRadius: '4px' },
-            thumbnail: { background: '#444', backgroundImage: 'linear-gradient(315deg, #111 0%, #445 90%)', borderColor: '#000', borderRadius: '0px', labelOpacity: 1, labelBackground: 'rgba(34, 34, 34, 0)', titleColor: '#fff', titleBgColor: 'transparent', titleShadow: '', descriptionColor: '#ccc', descriptionBgColor: 'transparent', descriptionShadow: '', stackBackground: '#aaa' },
-            thumbnailIcon: { padding: '5px', color: '#fff', shadow: '' },
-            pagination: { background: '#181818', backgroundSelected: '#666', color: '#fff', borderRadius: '2px', shapeBorder: '3px solid var(--SmartThemeQuoteColor)', shapeColor: '#444', shapeSelectedColor: '#aaa' },
-        },
-        galleryDisplayMode: 'pagination',
-        fnThumbnailOpen: (thumbnailItems) => viewWithDragbox(thumbnailItems, 'left'),
-        fnThumbnailInit: function (/** @type {JQuery<HTMLElement>} */ $thumbnail, /** @type {{src: string}} */ item) {
-            if (!item?.src) return;
-            $thumbnail.attr('title', String(item.src).split('/').pop());
-            // nanogallery2's data-idx is a rendered/filtered position, not a
-            // guaranteed index into the original items array. Keep the real
-            // source URL on the thumbnail so contextmenu can resolve the exact
-            // picture under the pointer.
-            $thumbnail.attr('data-gallery-src', item.src);
-            loadGalleryThumbnail($thumbnail, item);
-        },
-    });
-
-    // nanogallery2 handles normal left-clicks through fnThumbnailOpen. Its
-    // Hammer tap recognizer intentionally ignores non-primary mouse buttons,
-    // so right-click needs a native contextmenu handler of its own. Resolve
-    // the clicked picture by the source URL stored on the thumbnail rather
-    // than by nanogallery2's internal data-idx.
-    gallery.off('contextmenu.gallery');
-    gallery.on('contextmenu.gallery', '.nGY2GThumbnail', function (event) {
-        if (event.button !== 2) return;
-
-        const itemUrl = this.getAttribute('data-gallery-src');
-        if (!itemUrl) return;
-
-        event.preventDefault();
-        event.stopPropagation();
-
-        viewWithDragbox([{
-            responsiveURL: () => itemUrl,
-        }], 'right');
-    });
-
-    const dragDropHandler = new DragAndDropHandler(`#dragGallery.${nonce}`, async (files) => {
-        if (!Array.isArray(files) || files.length === 0) {
-            return;
-        }
-
-        // Upload into the active folder, which may have changed without remounting the modal.
-        for (const file of files) {
-            await uploadFile(file, getOpenGalleryUrl(url));
-        }
-
-        // Keep the modal and controls mounted; rebuild only the nanogallery instance.
-        await refreshGalleryContent(getOpenGalleryUrl(url));
-    });
-
-    const resizeHandler = function () {
-        if (gallery.closest('#gallery').length) {
-            gallery.nanogallery2('resize');
-        }
-    };
-
-    const chatChangedHandler = function () {
-        galleryRequestToken++;
-        removeGalleryPanel();
-    };
-
-    let cleanedUp = false;
-    const cleanup = function () {
-        if (cleanedUp) return;
-        cleanedUp = true;
-        try {
-            gallery.nanogallery2('destroy');
-        } catch (error) {
-            // The gallery may already have been destroyed during a replacement.
-            console.debug('Gallery cleanup skipped:', error);
-        }
-        gallery.off('contextmenu.gallery');
-        gallery.removeData('gallery-source-items');
-        gallery.removeData('gallery-cleanup');
-        dragDropHandler.destroy();
-        eventSource.removeListener('resizeUI', resizeHandler);
-        eventSource.removeListener(event_types.CHAT_CHANGED, chatChangedHandler);
-        eventSource.removeListener(CUSTOM_GALLERY_REMOVED_EVENT, cleanup);
-    };
-
-    eventSource.on('resizeUI', resizeHandler);
-    eventSource.on(event_types.CHAT_CHANGED, chatChangedHandler);
-    eventSource.once(CUSTOM_GALLERY_REMOVED_EVENT, cleanup);
-    gallery.data('gallery-cleanup', cleanup);
-
-    // Fixed-size grid thumbnails need no image-load race or forced resize.
-    gallery.css('height', 'unset');
-}
-
-/** Returns the active folder recorded on the mounted gallery panel. */
-function getOpenGalleryUrl(fallback) {
-    const value = $('#gallery').attr('data-gallery-url');
-    return value === undefined || value === '' ? fallback : value;
-}
-
-/**
- * Installs items in an existing modal when possible. The inner nanogallery2
- * instance and its handlers are destroyed/recreated while #gallery stays put.
- * @param {Array<Object>} items
- * @param {string} url
- * @param {number} requestToken
- */
-async function renderGalleryItems(items, url, requestToken) {
-    if (requestToken !== galleryRequestToken) return;
-    let panel = $('#movingDivs > #gallery');
-
-    if (panel.length) {
-        panel.attr('data-gallery-url', String(url ?? ''));
-        const gallery = panel.find('#dragGallery');
-        const cleanup = gallery.data('gallery-cleanup');
-        if (typeof cleanup === 'function') cleanup();
-        gallery.off('contextmenu.gallery')
-            .removeData('gallery-cleanup')
-            .removeClass()
-            .empty()
-            .css('height', 'unset');
-    } else {
-        await makeMovable(url);
-        panel = $('#movingDivs > #gallery');
-        if (requestToken !== galleryRequestToken) {
-            removeGalleryPanel();
-            return;
-        }
-        panel.attr('data-gallery-url', String(url ?? ''));
-    }
-
-    if (requestToken !== galleryRequestToken || !panel.length || !panel[0].isConnected) return;
-    await initGallery(items, url);
-    if (requestToken === galleryRequestToken) applyGallerySideToOpenWindows(false);
-}
-
-/**
- * Refreshes gallery content without unmounting the draggable modal.
- * @param {string} url Folder to display
- * @returns {Promise<void>}
- */
-async function refreshGalleryContent(url) {
-    if (!$('#movingDivs > #gallery').length) {
-        return showCharGallery(deleteModeActive);
-    }
-
-    const requestToken = ++galleryRequestToken;
-    try {
-        const items = await getGalleryItems(url);
-        if (requestToken !== galleryRequestToken || !$('#movingDivs > #gallery').length) return;
-        await renderGalleryItems(items, url, requestToken);
-    } catch (error) {
-        console.error('Failed to refresh gallery:', error);
-        toastr.error(t`Failed to refresh the gallery.`);
-    }
-}
-
-/**
- * Displays a character gallery using the nanogallery2 library.
- *
- * This function takes care of:
- * - Loading necessary resources for the gallery on the first invocation.
- * - Preparing gallery items based on the character or group selection.
- * - Handling the drag-and-drop functionality for image upload.
- * - Displaying the gallery in a popup.
- * - Cleaning up resources when the gallery popup is closed.
- *
- * @returns {Promise<void>} - Promise representing the completion of the gallery display process.
- */
-async function showCharGallery(deleteModeState = false) {
-    const requestToken = ++galleryRequestToken;
+async function loadFolder({ keepPage = false, previousPaths = null } = {}) {
+    if (!view.panel) return;
+    const token = ++view.token;
+    view.loadCtl?.abort();
+    const ctl = (view.loadCtl = new AbortController());
+    if (getLayout().aspect === 'auto') primeAspect();
+    view.panel.classList.add('gpp-busy');
+    if (view.items.length === 0) { view.status = 'loading'; renderPage(); }
 
     try {
-        await loadGalleryAssets();
-        if (!galleryWelcomeShown) {
-            toastr.info('Images can also be found in the folder `user/images`', 'Drag and drop images onto the gallery to upload them', { timeOut: 6000 });
-            galleryWelcomeShown = true;
+        const items = await fetchItems(view.folder, ctl.signal);
+        if (token !== view.token || !view.panel) return;
+        view.items = items;
+        view.status = 'ready';
+        useCachedAspect();
+        applyFilter();
+        if (previousPaths) {
+            // After an upload, show the page holding the first new file.
+            const index = view.filtered.findIndex(item => !previousPaths.has(item.path));
+            if (index >= 0) view.page = pageForIndex(index, view.pageSize);
+        } else if (!keepPage) {
+            view.page = 1;
         }
-
-        deleteModeActive = deleteModeState;
-        const context = SillyTavern.getContext();
-        let url = context.groupId || selected_group;
-        if (!context.groupId && context.characterId !== undefined && context.characterId !== null) {
-            url = getGalleryFolder(getCurrentGalleryCharacter());
-        }
-
-        const items = await getGalleryItems(url);
-        if (requestToken !== galleryRequestToken) return;
-        await renderGalleryItems(items, url, requestToken);
-    } catch (err) {
-        console.error('Failed to show gallery:', err);
-        toastr.error(t`Failed to load the gallery.`);
-    }
-}
-
-/**
- * Uploads a given file to a specified URL and reports the result. Callers
- * refresh the gallery contents in place after their upload batch completes.
- *
- * @param {File} file - The file object to be uploaded.
- * @param {string} url - The URL indicating where the file should be uploaded.
- * @returns {Promise<void>} - Promise representing the completion of the file upload and gallery refresh.
- */
-async function uploadFile(file, url) {
-    try {
-        // Convert the file to a base64 string
-        const fileBase64 = await getBase64Async(file);
-        const base64Data = fileBase64.split(',')[1];
-        const extension = getFileExtension(file);
-        const path = await saveBase64AsFile(base64Data, url, '', extension);
-
-        toastr.success(t`File uploaded successfully. Saved at: ${path}`);
-    } catch (error) {
-        console.error('There was an issue uploading the file:', error);
-
-        // Replacing alert with toastr error notification
-        toastr.error(t`Failed to upload the file.`);
-    }
-}
-
-/**
- * Creates a new draggable container based on a template.
- * This function takes a template with the ID 'generic_draggable_template' and clones it.
- * The cloned element has its attributes set, a new child div appended, and is made visible on the body.
- * Additionally, it sets up the element to prevent dragging on its images.
- * @param {string} url - The URL of the image source.
- * @returns {Promise<void>} - Promise representing the completion of the draggable container creation.
- */
-async function makeMovable(url) {
-    const id = 'gallery';
-    const template = $('#generic_draggable_template').html();
-    const newElement = $(template);
-    newElement.css({ 'background-color': 'var(--SmartThemeBlurTintColor)', 'opacity': 0 });
-    newElement.attr('forChar', id);
-    newElement.attr('id', id);
-    newElement.attr('data-gallery-url', String(url ?? ''));
-    newElement.find('.drag-grabber').attr('id', `${id}header`);
-    const dragTitle = newElement.find('.dragTitle');
-    dragTitle.addClass('flex-container justifySpaceBetween alignItemsBaseline');
-    const titleText = document.createElement('span');
-    titleText.textContent = t`Image Gallery`;
-    dragTitle.append(titleText);
-
-    // Create a container for the controls
-    const controlsContainer = document.createElement('div');
-    controlsContainer.classList.add('flex-container', 'alignItemsCenter');
-
-    const sortSelect = document.createElement('select');
-    sortSelect.classList.add('gallery-sort-select');
-
-    for (const sort of Object.values(SORT)) {
-        const option = document.createElement('option');
-        option.value = sort.value;
-        option.textContent = sort.label;
-        sortSelect.appendChild(option);
-    }
-
-    sortSelect.addEventListener('change', async () => {
-        const selectedOption = sortSelect.options[sortSelect.selectedIndex].value;
-        setSortOrder(selectedOption);
-        await refreshGalleryContent(getOpenGalleryUrl(url));
-    });
-
-    sortSelect.value = getSortOrder();
-    controlsContainer.appendChild(sortSelect);
-
-    const gallerySideToggle = document.createElement('div');
-    gallerySideToggle.classList.add('menu_button', 'menu_button_icon', 'interactable', 'gallery-side-toggle');
-    const updateGallerySideToggle = () => {
-        const side = getGallerySide();
-        gallerySideToggle.classList.toggle('toggled', side === 'right');
-        gallerySideToggle.title = side === 'right'
-            ? t`Move gallery to the left side`
-            : t`Move gallery to the right side`;
-        gallerySideToggle.setAttribute('aria-label', gallerySideToggle.title);
-        gallerySideToggle.setAttribute('aria-pressed', String(side === 'right'));
-        gallerySideToggle.innerHTML = '<i class="fa-solid fa-right-left fa-fw"></i>';
-    };
-    updateGallerySideToggle();
-    gallerySideToggle.addEventListener('click', () => {
-        toggleGallerySide();
-        updateGallerySideToggle();
-    });
-    controlsContainer.appendChild(gallerySideToggle);
-
-    // Create the "Add Image" button
-    const addImageButton = document.createElement('div');
-    addImageButton.classList.add('menu_button', 'menu_button_icon', 'interactable');
-    addImageButton.title = t`Add Image`;
-    addImageButton.innerHTML = '<i class="fa-solid fa-plus fa-fw"></i><div>Add Image</div>';
-
-    /**
-     * Create a compact page-flip button. Using nanogallery2's instance API
-     * avoids its jQuery wrapper typo in the next-page method.
-     */
-    const createPageButton = (direction, icon, label) => {
-        const button = document.createElement('div');
-        button.classList.add('menu_button', 'menu_button_icon', 'interactable', 'gallery-page-button');
-        button.title = label;
-        button.setAttribute('aria-label', label);
-        button.innerHTML = `<i class="${icon}"></i>`;
-        button.addEventListener('click', () => {
-            const liveGallery = $('#dragGallery');
-            if (!liveGallery.length) return;
-            const instance = liveGallery.nanogallery2('instance');
-            if (!instance) return;
-            if (direction === 'previous') {
-                instance.PaginationPreviousPage();
-            } else {
-                instance.PaginationNextPage();
-            }
-        });
-        return button;
-    };
-
-    // The compact page buttons intentionally sit immediately to the right of
-    // Add Image, as requested.
-    const previousPageButton = createPageButton('previous', 'fa-solid fa-chevron-left fa-fw', t`Previous gallery page`);
-    const nextPageButton = createPageButton('next', 'fa-solid fa-chevron-right fa-fw', t`Next gallery page`);
-
-    // Create a hidden file input
-    const fileInput = document.createElement('input');
-    fileInput.type = 'file';
-    fileInput.accept = 'image/*,video/*';
-    fileInput.multiple = true;
-    fileInput.style.display = 'none';
-
-    // Trigger file input when the button is clicked
-    addImageButton.addEventListener('click', () => {
-        fileInput.click();
-    });
-
-    // Handle file selection
-    fileInput.addEventListener('change', async () => {
-        const files = fileInput.files;
-        try {
-            if (files.length > 0) {
-                for (const file of files) {
-                    await uploadFile(file, getOpenGalleryUrl(url));
-                }
-                // Refresh the current folder without unmounting the modal.
-                await refreshGalleryContent(getOpenGalleryUrl(url));
-            }
-        } finally {
-            // Clearing the input also lets the user select the exact same file
-            // again later, which would otherwise not fire a `change` event.
-            fileInput.value = '';
-        }
-    });
-
-    controlsContainer.appendChild(addImageButton);
-    controlsContainer.appendChild(previousPageButton);
-    controlsContainer.appendChild(nextPageButton);
-    dragTitle.append(controlsContainer);
-    newElement.append(fileInput); // Append hidden file input to the main element
-
-    // add no-scrollbar class to this element
-    newElement.addClass('no-scrollbar');
-
-    // get the close button and set its id and data-related-id
-    const closeButton = newElement.find('.dragClose');
-    closeButton.attr('id', `${id}close`);
-    closeButton.attr('data-related-id', `${id}`);
-
-    const topBarElement = document.createElement('div');
-    topBarElement.classList.add('flex-container', 'alignItemsCenter');
-
-    let folderChangeRequest = 0;
-    const onChangeFolder = async (/** @type {Event|string} */ eventOrFolder) => {
-        if (eventOrFolder instanceof KeyboardEvent && eventOrFolder.key !== 'Enter') {
-            return;
-        }
-
-        // Capture the selected value and character identity before awaiting any
-        // network operation. This prevents an autocomplete selection from being
-        // replaced by a later UI event or a character switch.
-        const requestedFolder = String(typeof eventOrFolder === 'string'
-            ? eventOrFolder
-            : galleryFolderInput.value).trim();
-        if (!requestedFolder) {
-            toastr.warning(t`Folder name cannot be empty`);
-            return;
-        }
-
-        const requestId = ++folderChangeRequest;
-        const contextAtSelection = SillyTavern.getContext();
-        const characterIdAtSelection = contextAtSelection.characterId;
-        const avatarAtSelection = contextAtSelection.characters?.[characterIdAtSelection]?.avatar;
-
-        try {
-            if (contextAtSelection.groupId) {
-                throw new Error('Cannot change gallery folder in group chat');
-            }
-            if (characterIdAtSelection === undefined || characterIdAtSelection === null) {
-                throw new Error('Character is not selected');
-            }
-            if (!avatarAtSelection) {
-                throw new Error('Character PNG ID is not found');
-            }
-
-            const newUrl = await getSanitizedFilename(requestedFolder);
-            if (requestId !== folderChangeRequest) return;
-
-            updateGalleryFolder(newUrl, { characterId: characterIdAtSelection, avatar: avatarAtSelection });
-            galleryFolderInput.value = newUrl;
-            galleryFoldersCache = null;
-            galleryFoldersCacheTime = 0;
-            $('#gallery').attr('data-gallery-url', newUrl);
-            await refreshGalleryContent(newUrl);
-            toastr.info(t`Gallery folder changed to ${newUrl}`);
-        } catch (error) {
-            console.error('Failed to change gallery folder:', error);
-            toastr.error(error?.message || t`Unknown error`, t`Failed to change gallery folder`);
-        }
-    };
-
-    const onRestoreFolder = async () => {
-        try {
-            restoreGalleryFolder();
-            const restoredUrl = getGalleryFolder(getCurrentGalleryCharacter());
-            galleryFolderInput.value = restoredUrl;
-            $('#gallery').attr('data-gallery-url', restoredUrl);
-            await refreshGalleryContent(restoredUrl);
-        } catch (error) {
-            console.error('Failed to restore gallery folder:', error);
-            toastr.error(error?.message || t`Unknown error`, t`Failed to restore gallery folder`);
-        }
-    };
-
-    const galleryFolderInput = document.createElement('input');
-    galleryFolderInput.type = 'text';
-    galleryFolderInput.placeholder = t`Folder Name`;
-    galleryFolderInput.title = t`Enter a folder name to change the gallery folder`;
-    galleryFolderInput.value = url;
-    galleryFolderInput.classList.add('text_pole', 'gallery-folder-input', 'flex1');
-    galleryFolderInput.addEventListener('keyup', onChangeFolder);
-
-    const galleryFolderAccept = document.createElement('div');
-    galleryFolderAccept.classList.add('right_menu_button', 'fa-solid', 'fa-check', 'fa-fw');
-    galleryFolderAccept.title = t`Change gallery folder`;
-    galleryFolderAccept.addEventListener('click', onChangeFolder);
-
-    const galleryDeleteMode = document.createElement('div');
-    galleryDeleteMode.classList.add('right_menu_button', 'fa-solid', 'fa-trash', 'fa-fw');
-    galleryDeleteMode.classList.toggle('warning', deleteModeActive);
-    galleryDeleteMode.title = t`Delete mode`;
-    galleryDeleteMode.addEventListener('click', () => {
-        deleteModeActive = !deleteModeActive;
-        galleryDeleteMode.classList.toggle('warning', deleteModeActive);
-        if (deleteModeActive) {
-            toastr.info(t`Delete mode is ON. Click on images you want to delete.`);
-        }
-    });
-
-    const galleryFolderRestore = document.createElement('div');
-    galleryFolderRestore.classList.add('right_menu_button', 'fa-solid', 'fa-recycle', 'fa-fw');
-    galleryFolderRestore.title = t`Restore gallery folder`;
-    galleryFolderRestore.addEventListener('click', onRestoreFolder);
-
-    topBarElement.appendChild(galleryFolderInput);
-    topBarElement.appendChild(galleryFolderAccept);
-    topBarElement.appendChild(galleryDeleteMode);
-    topBarElement.appendChild(galleryFolderRestore);
-    newElement.append(topBarElement);
-
-    // Load folder suggestions only when the user focuses the input. This avoids
-    // blocking modal creation on a second API request and keeps suggestions fresh.
-    $(galleryFolderInput)
-        .autocomplete({
-            source: async (i, o) => {
-                const folders = await getGalleryFolders();
-                const term = String(i.term ?? '').toLowerCase();
-                const filtered = folders.filter(f => f.toLowerCase().includes(term));
-                o(filtered);
-            },
-            select: (e, u) => {
-                const selectedFolder = String(u?.item?.value ?? '');
-                galleryFolderInput.value = selectedFolder;
-                void onChangeFolder(selectedFolder);
-                return false;
-            },
-            minLength: 0,
-        })
-        .on('focus', () => $(galleryFolderInput).autocomplete('search', ''));
-
-    //add a div for the gallery
-    newElement.append('<div id="dragGallery"></div>');
-
-    $('#dragGallery').css('display', 'block');
-
-    $('#movingDivs').append(newElement);
-
-    loadMovingUIElementState(newElement);
-    $(`.draggable[forChar="${id}"]`).css('display', 'block');
-    dragElement(newElement);
-    ensureElementOnGallerySide(newElement, getGallerySide());
-    newElement.transition({
-        opacity: 1,
-        duration: animation_duration,
-        easing: animation_easing,
-    });
-
-    $(`.draggable[forChar="${id}"] img`).on('dragstart', (e) => {
-        e.preventDefault();
-        return false;
-    });
-}
-
-/**
- * Sets the gallery folder to a new URL.
- * @param {string} newUrl - The new URL to set for the gallery folder.
- */
-function updateGalleryFolder(newUrl, characterRef = {}) {
-    const folder = String(newUrl ?? '').trim();
-    if (!folder) {
-        throw new Error('Folder name cannot be empty');
-    }
-
-    const context = SillyTavern.getContext();
-    if (context.groupId) {
-        throw new Error('Cannot change gallery folder in group chat');
-    }
-
-    const characterId = characterRef.characterId ?? context.characterId;
-    if (characterId === undefined || characterId === null) {
-        throw new Error('Character is not selected');
-    }
-
-    const character = context.characters?.[characterId];
-    const avatar = characterRef.avatar ?? character?.avatar;
-    const name = character?.name;
-    if (!avatar) {
-        throw new Error('Character PNG ID is not found');
-    }
-
-    const currentGallerySettings = context.extensionSettings.gallery ?? (context.extensionSettings.gallery = {});
-    const existingFolders = currentGallerySettings.folders && typeof currentGallerySettings.folders === 'object'
-        ? currentGallerySettings.folders
-        : {};
-    const nextFolders = { ...existingFolders };
-
-    if (folder === name) {
-        // Selecting the character's own name means use the default folder.
-        delete nextFolders[avatar];
-    } else {
-        // Store a per-avatar override. Replacing the object also makes the
-        // mutation explicit for settings serializers and proxies.
-        nextFolders[avatar] = folder;
-    }
-
-    currentGallerySettings.folders = nextFolders;
-    context.saveSettingsDebounced();
-}
-
-
-/**
- * Restores the gallery folder to the default value.
- */
-function restoreGalleryFolder() {
-    const context = SillyTavern.getContext();
-    if (context.groupId) {
-        throw new Error('Cannot change gallery folder in group chat');
-    }
-    if (context.characterId === undefined || context.characterId === null) {
-        throw new Error('Character is not selected');
-    }
-    const avatar = context.characters?.[context.characterId]?.avatar;
-    if (!avatar) {
-        throw new Error('Character PNG ID is not found');
-    }
-    const existingOverride = context.extensionSettings.gallery.folders[avatar];
-    if (!existingOverride) {
-        throw new Error('No folder override found');
-    }
-    const folders = { ...(context.extensionSettings.gallery?.folders ?? {}) };
-    delete folders[avatar];
-    context.extensionSettings.gallery.folders = folders;
-    context.saveSettingsDebounced();
-}
-
-/**
- * Creates a new draggable image based on a template.
- *
- * This function clones a provided template with the ID 'generic_draggable_template',
- * appends the given image URL, ensures the element has a unique ID,
- * and attaches the element to the body. After appending, it also prevents
- * dragging on the appended image.
- *
- * @param {string} id - A base identifier for the new draggable element.
- * @param {string} url - The URL of the image to be added to the draggable element.
- * @param {'left'|'right'} side - The fixed screen side where the window should open.
- */
-function makeDragImg(id, url, side = 'left') {
-    // Step 1: Clone the template content
-    const template = document.getElementById('generic_draggable_template');
-
-    if (!(template instanceof HTMLTemplateElement)) {
-        console.error('The element is not a <template> tag');
-        return;
-    }
-
-    const newElement = document.importNode(template.content, true);
-
-    // Step 2: Append the given image
-    const mediaElement = isVideo(url)
-        ? document.createElement('video')
-        : document.createElement('img');
-    mediaElement.src = url;
-    if (mediaElement instanceof HTMLVideoElement) {
-        mediaElement.controls = true;
-        mediaElement.autoplay = true;
-    }
-
-    let uniqueId = `draggable_${id}`;
-    const draggableElem = /** @type {HTMLElement} */ (newElement.querySelector('.draggable'));
-    if (draggableElem) {
-        draggableElem.appendChild(mediaElement);
-
-        // Find a unique id for the draggable element
-
-        let counter = 1;
-        while (document.getElementById(uniqueId)) {
-            uniqueId = `draggable_${id}_${counter}`;
-            counter++;
-        }
-        draggableElem.id = uniqueId;
-
-        // Add the galleryImageDraggable to have unique class
-        draggableElem.classList.add('galleryImageDraggable');
-
-        // Ensure that the newly added element is displayed as block
-        draggableElem.style.display = 'block';
-        //and has no padding unlike other non-zoomed-avatar draggables
-        draggableElem.style.padding = '0';
-
-        // Add an id to the close button
-        // If the close button exists, set related-id
-        const closeButton = /** @type {HTMLElement} */ (draggableElem.querySelector('.dragClose'));
-        if (closeButton) {
-            closeButton.id = `${uniqueId}close`;
-            closeButton.dataset.relatedId = uniqueId;
-        }
-
-        // Find the .drag-grabber and set its matching unique ID
-        const dragGrabber = draggableElem.querySelector('.drag-grabber');
-        if (dragGrabber) {
-            dragGrabber.id = `${uniqueId}header`; // appending _header to make it match the parent's unique ID
-        }
-    }
-
-    // Step 3: Attach it to the movingDivs container
-    document.getElementById('movingDivs').appendChild(newElement);
-
-    // Step 4: Load the saved state for this window and enable dragging
-    const appendedElement = document.getElementById(uniqueId);
-    if (appendedElement) {
-        var elmntName = $(appendedElement);
-        loadMovingUIElementState(elmntName);
-        dragElement(elmntName);
-        keepGalleryWindowOnBackLayer(elmntName);
-        ensureElementOnGallerySide(elmntName, side);
-
-        // Prevent dragging the image
-        $(`#${uniqueId} img`).on('dragstart', (e) => {
-            e.preventDefault();
-            return false;
-        });
-    } else {
-        console.error('Failed to append the template content or retrieve the appended content.');
-    }
-}
-
-/**
- * Sanitizes a given ID to ensure it can be used as an HTML ID.
- * This function replaces spaces and non-word characters with dashes.
- * It also removes any non-ASCII characters.
- * @param {string} id - The ID to be sanitized.
- * @returns {string} - The sanitized ID.
- */
-function sanitizeHTMLId(id) {
-    // Replace spaces and non-word characters
-    id = id.replace(/\s+/g, '-')
-        .replace(/[^\x00-\x7F]/g, '-')
-        .replace(/\W/g, '');
-
-    return id;
-}
-
-/**
- * Processes a list of items (containing URLs) and creates a draggable box for the first item.
- *
- * If the provided list of items is non-empty, it takes the URL of the first item,
- * derives an ID from the URL, and uses the makeDragImg function to create
- * a draggable image element based on that ID and URL.
- *
- * @param {Array} items - A list of items where each item has a responsiveURL method that returns a URL.
- * @param {'left'|'right'} side - The fixed screen side where the window should open.
- */
-function viewWithDragbox(items, side = 'left') {
-    if (items && items.length > 0) {
-        const url = items[0].responsiveURL(); // Get the URL of the clicked image/video
-        if (deleteModeActive) {
-            Popup.show.confirm(t`Are you sure you want to delete this image?`, url)
-                .then(async (confirmed) => {
-                    if (!confirmed) {
-                        return;
-                    }
-                    deleteGalleryItem(url).then(() => refreshGalleryContent(getOpenGalleryUrl()));
-                });
+        renderPage();
+        if (view.revealed) {
+            void detectAspect();
         } else {
-            // ID should just be the last part of the URL, removing the extension
-            const id = sanitizeHTMLId(url.substring(url.lastIndexOf('/') + 1, url.lastIndexOf('.')));
-            makeDragImg(id, url, side);
+            // First open and the shape of this gallery is not known yet: wait briefly for it so the
+            // window appears once, already at its final size.
+            await Promise.race([detectAspect(), new Promise(resolve => setTimeout(resolve, REVEAL_TIMEOUT_MS))]);
+            if (token === view.token) revealPanel();
         }
+    } catch (error) {
+        if (error?.name === 'AbortError' || token !== view.token || !view.panel) return;
+        console.error('[Gallery++] Failed to load gallery:', error);
+        view.items = [];
+        view.filtered = [];
+        view.status = 'error';
+        renderPage();
+        revealPanel();
+        toastr.error(t`Failed to load the gallery.`);
+    } finally {
+        if (token === view.token) view.panel?.classList.remove('gpp-busy');
     }
 }
 
+// ------------------------------------------------------------------------------- rendering
 
-// Registers a simple command for opening the char gallery.
-SlashCommandParser.addCommandObject(SlashCommand.fromProps({
-    name: 'show-gallery',
-    aliases: ['sg'],
-    callback: () => {
-        showCharGallery();
-        return '';
-    },
-    helpString: 'Shows the gallery.',
-}));
-SlashCommandParser.addCommandObject(SlashCommand.fromProps({
-    name: 'list-gallery',
-    aliases: ['lg'],
-    callback: listGalleryCommand,
-    returns: 'list of images',
-    namedArgumentList: [
-        SlashCommandNamedArgument.fromProps({
-            name: 'char',
-            description: 'character name',
-            typeList: [ARGUMENT_TYPE.STRING],
-            enumProvider: commonEnumProviders.characters('character'),
-        }),
-        SlashCommandNamedArgument.fromProps({
-            name: 'group',
-            description: 'group name',
-            typeList: [ARGUMENT_TYPE.STRING],
-            enumProvider: commonEnumProviders.characters('group'),
-        }),
-    ],
-    helpString: 'List images in the gallery of the current char / group or a specified char / group.',
-}));
+function currentLayout() {
+    const layout = getLayout();
+    return { ...layout, pageSize: layout.rows * layout.cols };
+}
 
-async function listGalleryCommand(args) {
+const aspectCache = new Map(); // `${folder}|${count}` -> detected ratio
+
+/** Thumbnail resolution that matches the tiles actually on screen (a little extra for `cover` cropping). */
+function currentBucket() {
+    const tw = view.fit?.tw ?? DEFAULT_TILE_SIDE;
+    const th = view.fit?.th ?? DEFAULT_TILE_SIDE;
+    return thumbBucket(tw * 1.2, th * 1.2, window.devicePixelRatio);
+}
+
+function readAspectHints() {
+    try { return JSON.parse(window.localStorage.getItem(ASPECT_HINTS_KEY) ?? '{}') ?? {}; } catch { return {}; }
+}
+
+function saveAspectHint(folder, ratio) {
     try {
-        const context = SillyTavern.getContext();
-        let url = args.char ?? (args.group ? groups.find(it => it.name == args.group)?.id : null) ?? (selected_group || context.characterId);
-        if (!args.char && !args.group && !selected_group && context.characterId !== undefined && context.characterId !== null) {
-            url = getGalleryFolder(getCurrentGalleryCharacter());
+        const hints = readAspectHints();
+        if (hints[folder] === ratio) return;
+        hints[folder] = ratio;
+        window.localStorage.setItem(ASPECT_HINTS_KEY, JSON.stringify(hints));
+    } catch { /* storage unavailable: the hint is only an optimisation */ }
+}
+
+/** Starts from the last detected shape of this folder so the window opens at its final size. */
+function primeAspect() {
+    const ratio = Number(readAspectHints()[view.folder]);
+    if (ratio > 0 && Number.isFinite(ratio)) { view.autoRatio = ratio; return true; }
+    return false;
+}
+
+/** Width / height of a tile: the chosen shape, or the gallery's detected one. */
+function activeRatio() {
+    return parseAspect(getLayout().aspect) ?? view.autoRatio ?? DEFAULT_RATIO;
+}
+
+function useCachedAspect() {
+    const ratio = aspectCache.get(`${view.folder}|${view.items.length}`);
+    if (ratio) view.autoRatio = ratio;
+}
+
+async function imageRatio(blob) {
+    try {
+        if (typeof createImageBitmap === 'function') {
+            const bitmap = await createImageBitmap(blob);
+            const ratio = bitmap.width / bitmap.height;
+            bitmap.close?.();
+            return ratio;
         }
-
-        const [files, sanitizedUrl] = await Promise.all([
-            fetchImageFileList(url),
-            getSanitizedFilename(url),
-        ]);
-        return JSON.stringify(files.map(file => `user/images/${sanitizedUrl}/${file}`));
-    } catch (err) {
-        console.error(err);
-    }
-    return JSON.stringify([]);
-}
-
-function isTypingInGalleryContext() {
-    const activeElement = document.activeElement;
-    if (!(activeElement instanceof HTMLElement)) return false;
-
-    return activeElement instanceof HTMLInputElement
-        || activeElement instanceof HTMLTextAreaElement
-        || activeElement instanceof HTMLSelectElement
-        || activeElement.isContentEditable
-        || Boolean(activeElement.closest('[contenteditable="true"]'));
-}
-
-/**
- * Toggles the gallery panel open/closed.
- * When closing an existing panel, invalidate any in-flight gallery load so it
- * cannot recreate the panel after the user has closed it.
- */
-function toggleGalleryPanel() {
-    const galleryPanel = $('#dragGallery').closest('#gallery');
-    if (galleryPanel.length) {
-        galleryRequestToken++;
-        removeGalleryPanel();
-        return;
-    }
-
-    void showCharGallery();
-}
-
-/**
- * Closes every currently-opened gallery picture window. Reusing each window's
- * existing close button keeps the normal draggable cleanup/animation path.
- */
-function closeAllGalleryImages() {
-    $('.galleryImageDraggable .dragClose').each(function () {
-        this.click();
+    } catch { /* fall through */ }
+    return new Promise((resolve) => {
+        const url = URL.createObjectURL(blob);
+        const img = new Image();
+        img.onload = () => { URL.revokeObjectURL(url); resolve(img.naturalWidth / img.naturalHeight); };
+        img.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
+        img.src = url;
     });
 }
 
-/**
- * Handles gallery hotkeys without stealing them from text inputs.
- * '[' moves to the previous page, ']' moves to the next page, '\\' toggles
- * the gallery panel, and "=" closes all currently-opened gallery pictures.
- * @param {KeyboardEvent} event Keyboard event
- */
-function handleGalleryHotkeys(event) {
-    if (event.isComposing || event.defaultPrevented || (event.shiftKey || event.ctrlKey || event.altKey || event.metaKey)) {
+/** Finds the shape most pictures in the open gallery have (only when the option is 'auto'). */
+async function detectAspect() {
+    if (!view.panel || getLayout().aspect !== 'auto') return;
+    const token = view.token;
+    const key = `${view.folder}|${view.items.length}`;
+    const cached = aspectCache.get(key);
+    if (cached) {
+        if (view.autoRatio !== cached) { view.autoRatio = cached; fitPanel(); }
         return;
     }
-    if (isTypingInGalleryContext()) return;
-    if (Popup.util.isPopupOpen()) return;
+    const images = view.items.filter(i => !i.video);
+    if (images.length === 0) return;
+    const step = Math.max(1, images.length / ASPECT_SAMPLES);
+    const samples = [];
+    for (let i = 0; i < Math.min(ASPECT_SAMPLES, images.length); i++) samples.push(images[Math.floor(i * step)]);
 
-    if (event.key === '\\') {
-        toggleGalleryPanel();
-        event.preventDefault();
-        return;
+    const bucket = currentBucket();
+    const ratios = [];
+    await Promise.all(samples.map(async (item) => {
+        const blob = await getThumbnail(item.url, { video: false, bucket });
+        const ratio = blob ? await imageRatio(blob) : null;
+        if (ratio && Number.isFinite(ratio)) ratios.push(ratio);
+    }));
+    if (token !== view.token || !view.panel) return; // the gallery changed meanwhile
+    const value = dominantAspect(ratios);
+    const preset = ASPECT_PRESETS.find(p => p.value === value);
+    if (!preset) return;
+    aspectCache.set(key, preset.ratio);
+    saveAspectHint(view.folder, preset.ratio);
+    if (getLayout().aspect === 'auto' && view.autoRatio !== preset.ratio) {
+        view.autoRatio = preset.ratio;
+        fitPanel();
     }
+}
 
-    if (event.key === '=') {
-        closeAllGalleryImages();
-        event.preventDefault();
-        return;
-    }
-
-    if (event.key !== '[' && event.key !== ']') return;
-
-    const gallery = $('#dragGallery');
-    if (!gallery.length) return;
-
-    const instance = gallery.nanogallery2('instance');
-    if (!instance) return;
-
-    if (event.key === '[') {
-        instance.PaginationPreviousPage();
+function applyLayoutVariables() {
+    const { cols, rows } = getLayout();
+    const ratio = activeRatio();
+    // Before the first fit: a placeholder tile of the right shape.
+    const tw = view.fit?.tw ?? Math.round(DEFAULT_TILE_SIDE * Math.min(1, ratio));
+    const th = view.fit?.th ?? Math.round(tw / ratio);
+    const style = view.panel.style;
+    style.setProperty('--gpp-cols', String(cols));
+    style.setProperty('--gpp-rows', String(rows));
+    style.setProperty('--gpp-tw', `${tw}px`);
+    style.setProperty('--gpp-th', `${th}px`);
+    style.setProperty('--gpp-gap', `${GRID_GAP}px`);
+    style.setProperty('--gpp-pad', `${GRID_PADDING}px`);
+    if (isMobileLayout()) {
+        style.removeProperty('--gpp-grid-h'); // full-screen window: the grid area simply fills it
     } else {
-        instance.PaginationNextPage();
+        // The grid area always has the size of a full page, so the window never changes size
+        // while loading, on a half-empty last page, or when showing a message.
+        style.setProperty('--gpp-grid-h', `${rows * th + 2 * GRID_PADDING + (rows - 1) * GRID_GAP}px`);
+    }
+    view.refs.grid.classList.toggle('gpp-show-names', getBoolean('showNames'));
+}
+
+function disposeTiles() {
+    view.renderCtl?.abort();
+    view.renderCtl = null;
+    view.observer?.disconnect();
+    view.observer = null;
+    for (const tile of view.tiles.values()) {
+        if (tile.objectUrl) URL.revokeObjectURL(tile.objectUrl);
+    }
+    view.tiles.clear();
+}
+
+function showMessage(iconClass, text, ...actions) {
+    const { grid } = view.refs;
+    grid.replaceChildren(h('div', { class: 'gpp-message' }, icon(iconClass), h('div', {}, text), ...actions));
+    grid.classList.add('gpp-grid-empty');
+}
+
+function renderPage() {
+    if (!view.panel) return;
+    const { grid, scroller } = view.refs;
+    const layout = currentLayout();
+    view.pageSize = layout.pageSize;
+    const pages = pageCount(view.filtered.length, layout.pageSize);
+    view.page = clampPage(view.page, pages);
+
+    view.rendering = true;
+    disposeTiles();
+    grid.classList.remove('gpp-grid-empty');
+    updatePager(pages); // the pager height is part of the window chrome, so it must be final before fitting
+    fitPanel();         // synchronous: tiles are created at their final size, never resized afterwards
+
+    if (view.status === 'loading' && view.items.length === 0) {
+        showMessage('fa-solid fa-spinner fa-spin', t`Loading…`);
+    } else if (view.status === 'error') {
+        showMessage('fa-solid fa-triangle-exclamation', t`Could not load this gallery.`,
+            h('div', { class: 'menu_button menu_button_icon interactable', onClick: () => loadFolder() }, icon('fa-solid fa-rotate'), h('span', {}, t`Retry`)));
+    } else if (view.items.length === 0) {
+        showMessage('fa-regular fa-images', t`This gallery is empty. Drop images here or press “Add Image”.`);
+    } else if (view.filtered.length === 0) {
+        showMessage('fa-solid fa-magnifying-glass', `${t`No images match`} “${view.query}”.`,
+            h('div', { class: 'menu_button menu_button_icon interactable', onClick: () => setQuery('') }, icon('fa-solid fa-xmark'), h('span', {}, t`Clear search`)));
+    } else {
+        const ctl = (view.renderCtl = new AbortController());
+        const bucket = currentBucket();
+        view.renderedBucket = bucket;
+        const fragment = document.createDocumentFragment();
+        const pending = [];
+
+        for (const item of pageSlice(view.filtered, view.page, layout.pageSize)) {
+            const img = h('img', { class: 'gpp-img', alt: '', decoding: 'async', draggable: 'false' });
+            const el = h('div', {
+                class: `gpp-tile${item.video ? ' gpp-video' : ''}`,
+                tabindex: '0',
+                role: 'button',
+                title: item.name,
+                'aria-label': item.name,
+            }, img, item.video ? icon('fa-solid fa-circle-play gpp-badge') : null, h('span', { class: 'gpp-name' }, item.name));
+            const tile = { el, img, item, objectUrl: null };
+            view.tiles.set(el, tile);
+            fragment.append(el);
+
+            // Instant paint for thumbnails already in memory.
+            const hit = peekThumbnail(item.url, bucket);
+            if (hit) applyThumbnail(tile, hit);
+            else pending.push(tile);
+        }
+        grid.replaceChildren(fragment);
+
+        if (pending.length > 0) {
+            const start = (tile) => void loadTileThumbnail(tile, bucket, ctl.signal);
+            if (typeof IntersectionObserver === 'function') {
+                view.observer = new IntersectionObserver((entries, observer) => {
+                    for (const entry of entries) {
+                        if (!entry.isIntersecting) continue;
+                        observer.unobserve(entry.target);
+                        const tile = view.tiles.get(/** @type {HTMLElement} */ (entry.target));
+                        if (tile) start(tile);
+                    }
+                }, { root: scroller, rootMargin: '200px' });
+                for (const tile of pending) view.observer.observe(tile.el);
+            } else {
+                pending.forEach(start);
+            }
+        }
+    }
+
+    scroller.scrollTop = 0;
+    view.rendering = false;
+}
+
+/** @param {Tile} tile @param {Blob} blob */
+function applyThumbnail(tile, blob) {
+    if (!view.tiles.has(tile.el)) return;
+    if (tile.objectUrl) URL.revokeObjectURL(tile.objectUrl);
+    tile.objectUrl = URL.createObjectURL(blob);
+    tile.img.src = tile.objectUrl;
+    tile.el.classList.add('gpp-loaded');
+}
+
+/** @param {Tile} tile */
+async function loadTileThumbnail(tile, bucket, signal) {
+    const blob = await getThumbnail(tile.item.url, { video: tile.item.video, bucket, signal });
+    if (signal.aborted || !view.tiles.has(tile.el)) return;
+    if (blob) applyThumbnail(tile, blob);
+    else tile.el.classList.add('gpp-failed');
+}
+
+function updatePager(pages) {
+    if (!view.panel) return;
+    const { pageInput, pageTotal, first, prev, next, last, info } = view.refs;
+    pageInput.value = String(view.page);
+    pageInput.setAttribute('aria-label', `${t`Page`} (1–${pages})`);
+    pageInput.style.width = `${Math.max(3, String(pages).length + 2)}ch`;
+    pageTotal.textContent = `/ ${pages}`;
+    first.classList.toggle('disabled', view.page <= 1);
+    prev.classList.toggle('disabled', view.page <= 1);
+    next.classList.toggle('disabled', view.page >= pages);
+    last.classList.toggle('disabled', view.page >= pages);
+
+    const total = view.filtered.length;
+    if (view.items.length === 0) {
+        info.textContent = '';
+    } else {
+        const from = (view.page - 1) * view.pageSize + 1;
+        const to = Math.min(total, view.page * view.pageSize);
+        const range = total === 0 ? '0' : (pages > 1 ? `${from}–${to} ${t`of`} ${total}` : String(total));
+        const filtered = view.query && total !== view.items.length ? ` (${t`filtered from`} ${view.items.length})` : '';
+        info.textContent = `${range} ${total === 1 ? t`item` : t`items`}${filtered}`;
+    }
+}
+
+function goToPage(page) {
+    if (!view.panel) return;
+    const pages = pageCount(view.filtered.length, view.pageSize);
+    const target = clampPage(page, pages);
+    if (target === view.page) { updatePager(pages); return; }
+    view.page = target;
+    renderPage();
+}
+
+function setQuery(value) {
+    if (!view.panel) return;
+    view.query = String(value ?? '');
+    const { search, clearSearch } = view.refs;
+    if (search.value !== view.query) search.value = view.query;
+    clearSearch.hidden = view.query === '';
+    applyFilter();
+    view.page = 1;
+    renderPage();
+}
+
+/** Re-applies layout options (rows/cols/size) to the open window, keeping the user's place. */
+function applyLayoutToOpenGallery({ resizePanel = true } = {}) {
+    if (!view.panel) return;
+    const firstVisible = (view.page - 1) * view.pageSize;
+    view.page = pageForIndex(firstVisible, currentLayout().pageSize);
+    applyLayoutVariables();
+    if (resizePanel) {
+        if (!isMobileLayout()) {
+            // A stale saved size would otherwise win again the next time the window is opened.
+            const saved = power_user?.movingUIState?.[PANEL_ID];
+            if (saved) { delete saved.width; delete saved.height; SillyTavern.getContext().saveSettingsDebounced(); }
+        }
+        fitPanel();
+    }
+    void detectAspect();
+    renderPage();
+}
+
+// ------------------------------------------------------------------------------- window placement
+
+const FIT_GAP = 4;
+
+/**
+ * The free strip of screen beside the chat panel (#sheld) on the requested side.
+ * @param {'left'|'right'} side
+ * @returns {{left: number, top: number, width: number, height: number}}
+ */
+function getBounds(side, flush = false) {
+    const gap = flush ? 0 : FIT_GAP;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const sheld = document.getElementById('sheld');
+    let sl = vw / 2;
+    let sr = vw / 2;
+    if (sheld) {
+        const r = sheld.getBoundingClientRect();
+        if (r.width > 0 && getComputedStyle(sheld).display !== 'none') { sl = r.left; sr = r.right; }
+    }
+    const topBar = document.getElementById('top-bar')?.getBoundingClientRect();
+    const top = topBar && topBar.bottom > 0 && topBar.bottom < vh / 3 ? Math.ceil(topBar.bottom) + gap : gap;
+    const height = Math.max(120, vh - top - gap);
+    if (side === 'left') {
+        const width = Math.max(120, Math.floor(sl - 2 * gap));
+        return { left: gap, top, width, height };
+    }
+    const left = Math.ceil(sr) + gap;
+    return { left, top, width: Math.max(120, Math.floor(vw - left - gap)), height };
+}
+
+/** Pins a window against the chat panel (or the screen edge) inside the given bounds. */
+function placeInBounds(element, side, bounds, width, anchorBottom = false) {
+    const left = side === 'right' ? bounds.left : bounds.left + bounds.width - width;
+    element.style.left = `${Math.max(0, Math.round(left))}px`;
+    element.style.right = 'auto';
+    if (anchorBottom) {
+        // Sits on the bottom edge of the screen, like a character sprite.
+        element.style.top = 'auto';
+        element.style.bottom = '0px';
+    } else {
+        element.style.top = `${Math.round(bounds.top)}px`;
+        element.style.bottom = 'auto';
+    }
+    element.style.margin = 'unset';
+}
+
+/** Height of everything in the window except the picture grid (toolbars, pager, title, padding, gaps). */
+function measureChrome(panel, padY, gap) {
+    let chrome = padY;
+    let count = 0;
+    for (const child of panel.children) {
+        if (!(child instanceof HTMLElement) || child.hidden) continue;
+        const ccs = getComputedStyle(child);
+        if (ccs.display === 'none' || ccs.position === 'absolute' || ccs.position === 'fixed') continue;
+        count++;
+        if (child !== view.refs.scroller) chrome += child.offsetHeight;
+    }
+    return chrome + gap * Math.max(0, count - 1);
+}
+
+/**
+ * Sizes the gallery window and its thumbnails to the free strip beside the chat panel.
+ * The window sits flush against the chat panel and the bottom of the screen (like opened pictures)
+ * and hugs its grid; the tiles are as large as the strip allows for the chosen columns x rows,
+ * so a few big pictures and many small ones both fill the window neatly.
+ */
+function fitPanel() {
+    const panel = view.panel;
+    if (!panel || !panel.isConnected) return;
+    if (isMobileLayout()) { fitPanelMobile(panel); return; }
+    const side = panel.dataset.gppSide === 'left' || panel.dataset.gppSide === 'right' ? panel.dataset.gppSide : getSide();
+    panel.dataset.gppSide = side;
+    const bounds = getBounds(side, true);
+    const { cols, rows } = getLayout();
+    const ratio = activeRatio();
+    const cs = getComputedStyle(panel);
+    const px = (v) => parseFloat(v) || 0;
+    const padX = px(cs.paddingLeft) + px(cs.paddingRight) + px(cs.borderLeftWidth) + px(cs.borderRightWidth);
+    const padY = px(cs.paddingTop) + px(cs.paddingBottom) + px(cs.borderTopWidth) + px(cs.borderBottomWidth);
+    const gap = px(cs.rowGap) || 5;
+    const gridX = 2 * GRID_PADDING + (cols - 1) * GRID_GAP;
+    const gridY = 2 * GRID_PADDING + (rows - 1) * GRID_GAP;
+    const minWidth = Math.min(280, bounds.width); // the toolbars need some room even for a tiny grid
+
+    panel.style.minWidth = '0';
+    panel.style.height = '';
+    panel.style.maxHeight = `${bounds.height}px`;
+    panel.style.maxWidth = `${bounds.width}px`;
+
+    // The toolbar wraps differently at different widths, which changes the height left for the grid
+    // and with it the tile size and the width again. Iterate until that settles (usually 2 passes).
+    let width = bounds.width;
+    let tile = { tw: 24, th: 24 };
+    for (let pass = 0; pass < 5; pass++) {
+        panel.style.width = `${width}px`;
+        const chrome = measureChrome(panel, padY, gap);
+        tile = fitTile(width - padX - gridX - 1, bounds.height - chrome - gridY, cols, rows, ratio);
+        const wanted = Math.ceil(cols * tile.tw + gridX + padX + 1);
+        const next = Math.min(bounds.width, Math.max(minWidth, wanted));
+        if (Math.abs(next - width) < 1) break;
+        width = next;
+    }
+    panel.style.width = `${width}px`;
+    view.fit = tile;
+    applyLayoutVariables();
+
+    // Pin the window to the bottom edge with an explicit height. (With `height: auto` plus the
+    // `top`/`bottom` pair SillyTavern's dragging writes, the window would stretch.)
+    placeInBounds(panel, side, bounds, width, true);
+    const total = Math.min(bounds.height, Math.ceil(panel.getBoundingClientRect().height));
+    panel.style.height = `${total}px`;
+
+    // Tiles that became much bigger need a sharper thumbnail than the one they were rendered with.
+    if (!view.rendering && view.renderedBucket && view.tiles.size > 0 && currentBucket() > view.renderedBucket) {
+        renderPage();
+    }
+}
+
+/** Full-screen layout: tiles fill the width, and the whole page is fitted into the height when it can. */
+function fitPanelMobile(panel) {
+    const { cols, rows } = getLayout();
+    const ratio = activeRatio();
+    const scroller = view.refs.scroller;
+    const cs = getComputedStyle(panel);
+    const px = (v) => parseFloat(v) || 0;
+    const padY = px(cs.paddingTop) + px(cs.paddingBottom) + px(cs.borderTopWidth) + px(cs.borderBottomWidth);
+    const gridX = 2 * GRID_PADDING + (cols - 1) * GRID_GAP;
+    const gridY = 2 * GRID_PADDING + (rows - 1) * GRID_GAP;
+    const availW = (scroller?.clientWidth || panel.clientWidth || window.innerWidth) - 10 - gridX;
+    // Screen height minus the toolbars/pager. Deliberately not the scroller's own height: that depends on
+    // the tiles being sized here.
+    const availH = window.innerHeight - measureChrome(panel, padY, px(cs.rowGap) || 5) - gridY;
+    view.fit = fitTile(availW, availH, cols, rows, ratio);
+    applyLayoutVariables();
+}
+
+/** @param {HTMLElement} win @param {'left'|'right'} side */
+function fitImageWindow(win, side) {
+    if (isMobileLayout()) return;
+    win.dataset.gppSide = side;
+    const w = Number(win.dataset.gppW);
+    const hgt = Number(win.dataset.gppH);
+    const bounds = getBounds(side, true);
+    let width;
+    let height;
+    if (w > 0 && hgt > 0) {
+        const scale = Math.min(bounds.width / w, bounds.height / hgt, 2);
+        width = Math.max(40, Math.floor(w * scale));
+        height = Math.max(40, Math.floor(hgt * scale));
+    } else {
+        width = Math.min(bounds.width, 320);
+        height = Math.min(bounds.height, 320);
+    }
+    win.style.maxWidth = `${bounds.width}px`;
+    win.style.maxHeight = `${bounds.height}px`;
+    win.style.width = `${width}px`;
+    win.style.height = `${height}px`;
+    placeInBounds(win, side, bounds, width, true);
+}
+
+function fitAllWindows() {
+    fitPanel();
+    if (isMobileLayout()) return;
+    document.querySelectorAll('.galleryImageDraggable').forEach((win) => {
+        if (win instanceof HTMLElement) fitImageWindow(win, win.dataset.gppSide === 'left' ? 'left' : 'right');
+    });
+}
+
+/** After the user drags a window across the chat panel, remember which side it now belongs to. */
+function rememberDraggedSides() {
+    const sheld = document.getElementById('sheld')?.getBoundingClientRect();
+    if (!sheld) return;
+    const mid = (sheld.left + sheld.right) / 2;
+    document.querySelectorAll('#gallery, .galleryImageDraggable').forEach((win) => {
+        if (!(win instanceof HTMLElement)) return;
+        const r = win.getBoundingClientRect();
+        if (r.width) win.dataset.gppSide = r.left + r.width / 2 < mid ? 'left' : 'right';
+    });
+}
+
+function applySavedWindowState(element) {
+    const state = element.id ? power_user?.movingUIState?.[element.id] : null;
+    if (state && typeof state === 'object') $(element).css(state);
+    return state ?? null;
+}
+
+// ------------------------------------------------------------------------------- panel construction
+
+function buildPanel() {
+    const template = document.getElementById('generic_draggable_template');
+    if (!(template instanceof HTMLTemplateElement)) throw new Error('generic_draggable_template is missing');
+    const panel = /** @type {HTMLElement} */ (template.content.firstElementChild.cloneNode(true));
+    panel.id = PANEL_ID;
+    panel.classList.add('gpp-panel');
+    panel.setAttribute('forChar', PANEL_ID);
+    panel.style.opacity = '0';
+    panel.style.backgroundColor = 'var(--SmartThemeBlurTintColor)';
+    panel.querySelector('.drag-grabber').id = `${PANEL_ID}header`;
+    const closeButton = panel.querySelector('.dragClose');
+    closeButton.id = `${PANEL_ID}close`;
+    closeButton.setAttribute('data-related-id', PANEL_ID);
+    panel.querySelector('.dragTitle').classList.add('flex-container', 'alignItemsBaseline');
+    panel.querySelector('.dragTitle').append(h('span', {}, t`Image Gallery`), h('small', { class: 'gpp-title-tag' }, '++'));
+
+    const refs = {};
+
+    // --- folder row
+    refs.folderInput = h('input', {
+        type: 'text', class: 'text_pole gallery-folder-input flex1', placeholder: t`Folder Name`,
+        title: t`Enter a folder name to assign it to this character`, spellcheck: 'false', autocomplete: 'off',
+    });
+    refs.folderAccept = h('div', { class: 'right_menu_button fa-solid fa-check fa-fw', title: t`Assign this folder to the character`, role: 'button' });
+    refs.deleteToggle = h('div', { class: 'right_menu_button fa-solid fa-trash fa-fw', title: t`Delete mode`, role: 'button', 'aria-pressed': 'false' });
+    refs.folderRestore = h('div', { class: 'right_menu_button fa-solid fa-recycle fa-fw', title: t`Restore the default gallery folder`, role: 'button' });
+    const folderRow = h('div', { class: 'gpp-row' }, refs.folderInput, refs.folderAccept, refs.deleteToggle, refs.folderRestore);
+
+    // --- search / sort / side / add row
+    refs.search = h('input', { type: 'search', class: 'text_pole gpp-search', placeholder: t`Search by name…`, 'aria-label': t`Search images by name`, spellcheck: 'false', autocomplete: 'off' });
+    refs.clearSearch = h('div', { class: 'gpp-clear fa-solid fa-xmark', title: t`Clear search`, role: 'button', hidden: true });
+    const searchBox = h('div', { class: 'gpp-searchbox' }, icon('fa-solid fa-magnifying-glass gpp-search-icon'), refs.search, refs.clearSearch);
+
+    refs.sort = h('select', { class: 'gallery-sort-select', 'aria-label': t`Sort order` },
+        SORTS.map(s => h('option', { value: s.value }, s.label)));
+    refs.sort.value = getSort();
+    refs.sideToggle = h('div', { class: 'menu_button menu_button_icon interactable gallery-side-toggle', role: 'button' }, icon('fa-solid fa-right-left fa-fw'));
+    refs.addButton = h('div', { class: 'menu_button menu_button_icon interactable', title: t`Add Image`, role: 'button' }, icon('fa-solid fa-plus fa-fw'), h('div', {}, t`Add Image`));
+    refs.fileInput = h('input', { type: 'file', accept: 'image/*,video/*', multiple: true, style: 'display:none' });
+    const toolRow = h('div', { class: 'gpp-row gpp-row-wrap' }, searchBox, refs.sort, refs.sideToggle, refs.addButton);
+
+    // --- grid
+    refs.grid = h('div', { class: 'gpp-grid', role: 'list' });
+    refs.scroller = h('div', { class: 'gpp-scroller' }, refs.grid);
+
+    // --- pager
+    const pagerButton = (classes, label) => h('div', { class: `menu_button menu_button_icon interactable gallery-page-button`, title: label, 'aria-label': label, role: 'button' }, icon(classes));
+    refs.first = pagerButton('fa-solid fa-angles-left fa-fw', t`First page`);
+    refs.prev = pagerButton('fa-solid fa-chevron-left fa-fw', t`Previous gallery page`);
+    refs.next = pagerButton('fa-solid fa-chevron-right fa-fw', t`Next gallery page`);
+    refs.last = pagerButton('fa-solid fa-angles-right fa-fw', t`Last page`);
+    refs.pageInput = h('input', {
+        type: 'text', inputmode: 'numeric', class: 'text_pole gpp-page-input', value: '1',
+        title: t`Type a page number and press Enter to jump to it`, autocomplete: 'off',
+    });
+    refs.pageTotal = h('span', { class: 'gpp-page-total' }, '/ 1');
+    refs.info = h('span', { class: 'gpp-info' });
+    const pager = h('div', { class: 'gpp-pager' },
+        refs.first, refs.prev,
+        h('div', { class: 'gpp-page-jump' }, refs.pageInput, refs.pageTotal),
+        refs.next, refs.last, refs.info);
+
+    panel.append(folderRow, toolRow, refs.scroller, pager, refs.fileInput);
+    view.refs = refs;
+    wirePanel(panel);
+    return panel;
+}
+
+function updateSideToggle() {
+    const { sideToggle } = view.refs;
+    const right = getSide() === 'right';
+    sideToggle.classList.toggle('toggled', right);
+    const label = right ? t`Move gallery to the left side` : t`Move gallery to the right side`;
+    sideToggle.title = label;
+    sideToggle.setAttribute('aria-label', label);
+    sideToggle.setAttribute('aria-pressed', String(right));
+}
+
+function updateFolderControls() {
+    const { folderInput, folderAccept, folderRestore } = view.refs;
+    const group = view.kind === 'group';
+    folderInput.value = view.folder;
+    folderInput.readOnly = group;
+    folderInput.title = group ? t`Group galleries use a fixed folder` : t`Enter a folder name to assign it to this character`;
+    folderAccept.hidden = group;
+    folderRestore.hidden = group;
+}
+
+/**
+ * Folder-name suggestions: a small self-made dropdown (no jQuery UI, no <datalist>), so picking
+ * an entry always assigns that folder.
+ */
+function wireFolderSuggestions(input, submit) {
+    const list = h('div', { class: 'gpp-suggest', role: 'listbox', hidden: true });
+    document.body.append(list);
+    view.refs.suggest = list;
+    let entries = [];
+    let active = -1;
+    let seq = 0;
+
+    const isOpen = () => !list.hidden;
+    const close = () => { seq++; list.hidden = true; active = -1; document.removeEventListener('pointerdown', onOutside, true); };
+    const onOutside = (e) => { if (e.target !== input && !list.contains(e.target)) close(); };
+    const position = () => {
+        const r = input.getBoundingClientRect();
+        list.style.left = `${Math.round(r.left)}px`;
+        list.style.top = `${Math.round(r.bottom + 2)}px`;
+        list.style.width = `${Math.round(r.width)}px`;
+        list.style.maxHeight = `${Math.max(120, Math.min(260, window.innerHeight - r.bottom - 12))}px`;
+    };
+    const setActive = (index) => {
+        active = index;
+        [...list.children].forEach((el, i) => el.classList.toggle('gpp-active', i === index));
+        list.children[index]?.scrollIntoView({ block: 'nearest' });
+    };
+    const choose = (name) => {
+        input.value = name;
+        close();
+        submit();
+    };
+    const render = () => {
+        list.replaceChildren(...entries.map((name, i) => {
+            const item = h('div', { class: `gpp-suggest-item${name === view.folder ? ' gpp-current' : ''}`, role: 'option', title: name }, name);
+            item.addEventListener('mousedown', (e) => e.preventDefault()); // keep the input focused
+            item.addEventListener('click', () => choose(name));
+            item.addEventListener('mousemove', () => { if (active !== i) setActive(i); });
+            return item;
+        }));
+        if (!entries.length) { close(); return; }
+        position();
+        if (!isOpen()) { list.hidden = false; document.addEventListener('pointerdown', onOutside, true); }
+    };
+    const open = async (filter) => {
+        if (input.readOnly) return;
+        const mine = ++seq;
+        const all = await getAllFolders();
+        if (mine !== seq) return;
+        const term = String(filter ?? '').trim().toLowerCase();
+        entries = all.filter(f => !term || f.toLowerCase().includes(term));
+        active = -1;
+        render();
+    };
+
+    input.addEventListener('focus', () => void open(''));
+    input.addEventListener('click', () => { if (!isOpen()) void open(''); });
+    input.addEventListener('input', () => void open(input.value));
+    input.addEventListener('blur', () => setTimeout(() => { if (document.activeElement !== input) close(); }, 150));
+    input.addEventListener('keydown', (e) => {
+        e.stopPropagation();
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+            if (!isOpen()) { void open(''); e.preventDefault(); return; }
+            e.preventDefault();
+            const n = entries.length;
+            if (n) setActive(e.key === 'ArrowDown' ? (active + 1) % n : (active - 1 + n) % n);
+        } else if (e.key === 'Enter') {
+            e.preventDefault();
+            if (isOpen() && active >= 0 && entries[active] !== undefined) choose(entries[active]);
+            else { close(); submit(); }
+        } else if (e.key === 'Escape' && isOpen()) {
+            e.preventDefault();
+            close();
+        }
+    });
+    window.addEventListener('resize', close);
+    list.addEventListener('wheel', (e) => e.stopPropagation(), { passive: true });
+}
+
+function wirePanel(panel) {
+    const r = view.refs;
+
+    // Pager
+    r.first.addEventListener('click', () => goToPage(1));
+    r.prev.addEventListener('click', () => goToPage(view.page - 1));
+    r.next.addEventListener('click', () => goToPage(view.page + 1));
+    r.last.addEventListener('click', () => goToPage(Number.MAX_SAFE_INTEGER));
+    r.pageInput.addEventListener('focus', () => r.pageInput.select());
+    r.pageInput.addEventListener('keydown', (e) => {
+        e.stopPropagation();
+        if (e.key === 'Enter') { e.preventDefault(); commitPageInput(); r.pageInput.select(); }
+        else if (e.key === 'Escape') { r.pageInput.value = String(view.page); r.pageInput.blur(); }
+        else if (e.key === 'ArrowUp') { e.preventDefault(); goToPage(view.page + 1); }
+        else if (e.key === 'ArrowDown') { e.preventDefault(); goToPage(view.page - 1); }
+    });
+    r.pageInput.addEventListener('blur', commitPageInput);
+
+    // Search
+    const runSearch = debounce(() => setQuery(r.search.value), SEARCH_DEBOUNCE_MS);
+    r.search.addEventListener('input', () => { r.clearSearch.hidden = r.search.value === ''; runSearch(); });
+    r.search.addEventListener('keydown', (e) => {
+        e.stopPropagation();
+        if (e.key === 'Escape' && r.search.value) { e.preventDefault(); runSearch.cancel(); setQuery(''); }
+        else if (e.key === 'Enter') { runSearch.cancel(); setQuery(r.search.value); }
+    });
+    r.clearSearch.addEventListener('click', () => { runSearch.cancel(); setQuery(''); r.search.focus(); });
+
+    // Sort / side / upload
+    r.sort.addEventListener('change', () => { setSort(r.sort.value); void loadFolder(); });
+    updateSideToggle();
+    r.sideToggle.addEventListener('click', () => {
+        setSide(getSide() === 'right' ? 'left' : 'right');
+        updateSideToggle();
+        panel.dataset.gppSide = getSide();
+        fitPanel();
+    });
+    r.addButton.addEventListener('click', () => r.fileInput.click());
+    r.fileInput.addEventListener('change', async () => {
+        const files = [...r.fileInput.files];
+        r.fileInput.value = ''; // lets the same file be chosen again
+        if (files.length) await uploadFiles(files);
+    });
+
+    // Folder assignment
+    const submitFolder = () => void applyFolderChoice(r.folderInput.value);
+    r.folderAccept.addEventListener('click', submitFolder);
+    r.folderRestore.addEventListener('click', () => void restoreDefaultFolder());
+    r.deleteToggle.addEventListener('click', () => setDeleteMode(!view.deleteMode));
+    wireFolderSuggestions(r.folderInput, submitFolder);
+
+    // Grid: left-click → left window, right-click → right window, Enter/Space like left-click.
+    r.grid.addEventListener('click', (e) => onTileActivate(e, 'left'));
+    r.grid.addEventListener('contextmenu', (e) => onTileActivate(e, 'right'));
+    r.grid.addEventListener('dragstart', (e) => e.preventDefault());
+    r.grid.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        if (!(e.target instanceof HTMLElement) || !e.target.classList.contains('gpp-tile')) return;
+        e.preventDefault();
+        onTileActivate(e, e.shiftKey ? 'right' : 'left');
+    });
+
+    // Drag & drop upload. Native listeners on the panel die with it (no leaked handlers).
+    const hasFiles = (e) => Array.from(e.dataTransfer?.types ?? []).includes('Files');
+    let depth = 0;
+    panel.addEventListener('dragenter', (e) => { if (!hasFiles(e)) return; e.preventDefault(); e.stopPropagation(); depth++; panel.classList.add('gpp-dropping'); });
+    panel.addEventListener('dragover', (e) => { if (!hasFiles(e)) return; e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = 'copy'; });
+    panel.addEventListener('dragleave', (e) => { if (!hasFiles(e)) return; depth = Math.max(0, depth - 1); if (!depth) panel.classList.remove('gpp-dropping'); });
+    panel.addEventListener('drop', (e) => {
+        if (!hasFiles(e)) return;
+        e.preventDefault(); e.stopPropagation();
+        depth = 0; panel.classList.remove('gpp-dropping');
+        const files = [...e.dataTransfer.files];
+        if (files.length) void uploadFiles(files);
+    });
+}
+
+function commitPageInput() {
+    const { pageInput } = view.refs;
+    if (!pageInput) return;
+    const pages = pageCount(view.filtered.length, view.pageSize);
+    const parsed = parsePageInput(pageInput.value, pages);
+    if (parsed === null) { pageInput.value = String(view.page); return; }
+    goToPage(parsed);
+    pageInput.value = String(view.page);
+}
+
+function setDeleteMode(on) {
+    view.deleteMode = Boolean(on);
+    view.refs.deleteToggle.classList.toggle('warning', view.deleteMode);
+    view.refs.deleteToggle.setAttribute('aria-pressed', String(view.deleteMode));
+    view.panel.classList.toggle('gpp-delete-mode', view.deleteMode);
+    if (view.deleteMode) toastr.info(t`Delete mode is ON. Click on images you want to delete.`);
+}
+
+// ------------------------------------------------------------------------------- actions
+
+/** @param {Event} event @param {'left'|'right'} side */
+function onTileActivate(event, side) {
+    const el = event.target instanceof Element ? event.target.closest('.gpp-tile') : null;
+    if (!el) return;
+    const tile = view.tiles.get(/** @type {HTMLElement} */ (el));
+    if (!tile) return;
+    event.preventDefault();
+    if (view.deleteMode) void deleteItem(tile.item);
+    else openMedia(tile.item, side);
+}
+
+async function deleteItem(item) {
+    const confirmed = await Popup.show.confirm(t`Are you sure you want to delete this image?`, item.path);
+    if (!confirmed) return;
+    const deleted = await deleteMediaFromServer(item.path, false);
+    if (!deleted) return;
+    toastr.success(t`Image deleted successfully.`);
+    void purgeThumbnail(item.url);
+    $(`.galleryImageDraggable[data-src="${CSS.escape(item.url)}"] .dragClose`).trigger('click');
+    // Update locally; no need to re-list the whole folder.
+    view.items = view.items.filter(i => i.path !== item.path);
+    applyFilter();
+    renderPage();
+}
+
+async function uploadFiles(files) {
+    if (view.uploading || !view.panel) return;
+    const accepted = files.filter(f => /^(image|video)\//.test(f.type) || isVideoName(f.name, VIDEO_EXTENSIONS) || /\.(png|jpe?g|gif|webp|bmp|avif|svg)$/i.test(f.name));
+    if (accepted.length === 0) { toastr.warning(t`Only image and video files can be uploaded.`); return; }
+
+    view.uploading = true;
+    view.panel.classList.add('gpp-busy');
+    const folder = view.folder;
+    const before = new Set(view.items.map(i => i.path));
+    let ok = 0;
+    let failed = 0;
+    try {
+        for (const file of accepted) {
+            try {
+                const base64 = (await getBase64Async(file)).split(',')[1];
+                await saveBase64AsFile(base64, folder, '', getFileExtension(file));
+                ok++;
+            } catch (error) {
+                failed++;
+                console.error('[Gallery++] Upload failed:', error);
+            }
+        }
+    } finally {
+        view.uploading = false;
+    }
+    if (ok) toastr.success(`${t`Uploaded`} ${ok} ${ok === 1 ? t`file` : t`files`}.`);
+    if (failed) toastr.error(`${t`Failed to upload`} ${failed} ${failed === 1 ? t`file` : t`files`}.`);
+    if (view.panel && view.folder === folder) await loadFolder({ previousPaths: before });
+}
+
+let folderBusy = false;
+
+async function applyFolderChoice(requested) {
+    if (!view.panel || folderBusy) return;
+    const target = getTarget();
+    const name = String(requested ?? '').trim();
+    if (!name) { toastr.warning(t`Folder name cannot be empty`); return; }
+    folderBusy = true;
+    try {
+        if (!target || target.kind !== 'char') throw new Error(target?.kind === 'group' ? 'Cannot change gallery folder in group chat' : 'Character is not selected');
+        const { character } = target;
+        if (!character.avatar) throw new Error('Character PNG ID is not found');
+
+        // Use the exact spelling of an existing folder (matters on case-sensitive file systems).
+        const existing = await getAllFolders();
+        const wanted = existing.find(f => f.toLowerCase() === name.toLowerCase()) ?? name;
+
+        const [safe, safeDefault] = await Promise.all([sanitizeFolder(wanted), sanitizeFolder(character.name)]);
+        const stillSame = getTarget()?.character?.avatar === character.avatar;
+        if (!stillSame || !view.panel) return; // the user switched character while we were waiting
+
+        const isDefault = safe === safeDefault;
+        setFolderOverride(character.avatar, isDefault ? null : safe);
+        const nextFolder = isDefault ? character.name : safe;
+        foldersCache = { time: 0, list: null };
+        updateFolderControls();
+        if (nextFolder === view.folder) {
+            toastr.info(t`This gallery is already showing the folder ${nextFolder}`);
+            return;
+        }
+        view.folder = nextFolder;
+        updateFolderControls();
+        await loadFolder();
+        toastr.info(t`Gallery folder changed to ${nextFolder}`);
+    } catch (error) {
+        console.error('[Gallery++] Failed to change gallery folder:', error);
+        toastr.error(error?.message || t`Unknown error`, t`Failed to change gallery folder`);
+    } finally {
+        folderBusy = false;
+    }
+}
+
+async function restoreDefaultFolder() {
+    const target = getTarget();
+    if (!target || target.kind !== 'char' || !view.panel) return;
+    if (!getFolderOverride(target.character.avatar)) { toastr.info(t`This character already uses its default folder.`); return; }
+    setFolderOverride(target.character.avatar, null);
+    view.folder = target.character.name;
+    updateFolderControls();
+    await loadFolder();
+}
+
+// ------------------------------------------------------------------------------- open / close
+
+async function openGallery() {
+    const target = getTarget();
+    if (!target) { toastr.info(t`Select a character or group to open its gallery.`); return; }
+
+    if (view.panel?.isConnected) {
+        // Already open: follow the current chat, or just refresh the listing.
+        if (!(await syncToContext())) await loadFolder({ keepPage: true });
+        return;
+    }
+    // A previous window may still be fading out; two elements with one id would break dragging.
+    document.getElementById(PANEL_ID)?.remove();
+    view.panel = null;
+    view.fit = null;
+    view.kind = target.kind;
+    view.folder = target.folder;
+    view.items = [];
+    view.filtered = [];
+    view.query = '';
+    view.page = 1;
+    view.status = 'loading';
+    view.deleteMode = false;
+
+    let panel;
+    try {
+        panel = buildPanel();
+    } catch (error) {
+        console.error('[Gallery++] Could not build the gallery window:', error);
+        toastr.error(t`Failed to load the gallery.`);
+        return;
+    }
+    view.panel = panel;
+    view.revealed = false;
+    view.renderedBucket = 0;
+    updateFolderControls();
+    const shapeKnown = getLayout().aspect !== 'auto' || primeAspect();
+    applyLayoutVariables();
+
+    document.getElementById('movingDivs').append(panel);
+    view.fit = null;
+    if (isMobileLayout()) applySavedWindowState(panel);
+    else panel.dataset.gppSide = getSide();
+    dragElement($(panel));
+    renderPage(); // fits the (still invisible) window to its final size
+    // Show it right away when its final shape is certain; otherwise loadFolder() reveals it as soon as
+    // the shape is detected. The timer is only a safety net for a slow or failing server.
+    if (shapeKnown) revealPanel();
+    else setTimeout(() => { if (view.panel === panel) revealPanel(); }, REVEAL_TIMEOUT_MS + 600);
+    await loadFolder();
+}
+
+function closeGallery() {
+    const panel = view.panel;
+    if (!panel) return;
+    view.token++;
+    view.loadCtl?.abort();
+    disposeTiles();
+    view.refs.suggest?.remove();
+    view.panel = null;
+    view.refs = {};
+    view.fit = null;
+    view.renderedBucket = 0;
+    view.items = [];
+    view.filtered = [];
+    if (panel.isConnected) fadeRemove(panel);
+}
+
+function toggleGallery() {
+    if (view.panel?.isConnected) closeGallery();
+    else void openGallery();
+}
+
+/**
+ * Called when the active chat changes: follow the new character/group in place.
+ * @returns {Promise<boolean>} true when the window switched to a different folder (or closed)
+ */
+async function syncToContext() {
+    if (!view.panel) return false;
+    const target = getTarget();
+    if (!target) { closeGallery(); return true; }
+    if (target.kind === view.kind && target.folder === view.folder) return false;
+    view.kind = target.kind;
+    view.folder = target.folder;
+    view.items = [];
+    view.filtered = [];
+    view.status = 'loading';
+    view.query = '';
+    view.refs.search.value = '';
+    view.refs.clearSearch.hidden = true;
+    updateFolderControls();
+    await loadFolder();
+    return true;
+}
+
+// ------------------------------------------------------------------------------- media windows
+
+/** @param {GalleryItem} item @param {'left'|'right'} side */
+function openMedia(item, side) {
+    const existing = document.querySelector(`.galleryImageDraggable[data-src="${CSS.escape(item.url)}"]`);
+    if (existing instanceof HTMLElement) {
+        // Same picture already open: move it to the requested side instead of stacking duplicates.
+        fitImageWindow(existing, side);
+        existing.classList.add('gpp-flash');
+        setTimeout(() => existing.classList.remove('gpp-flash'), 600);
+        return;
+    }
+
+    const template = document.getElementById('generic_draggable_template');
+    if (!(template instanceof HTMLTemplateElement)) return;
+    const win = /** @type {HTMLElement} */ (template.content.firstElementChild.cloneNode(true));
+
+    const stem = baseName(item.path).replace(/\.[^.]+$/, '');
+    const baseId = `draggable_${sanitizeHTMLId(stem)}`;
+    let id = baseId;
+    for (let n = 1; document.getElementById(id); n++) id = `${baseId}_${n}`;
+
+    win.id = id;
+    win.classList.add('galleryImageDraggable');
+    win.dataset.src = item.url;
+    win.style.display = 'block';
+    win.style.padding = '0';
+    win.style.opacity = '0';
+    // Stay invisible (and un-clickable) until the real picture size is known, so the user never sees
+    // a placeholder-sized window that then jumps to its final size.
+    win.style.visibility = 'hidden';
+    win.querySelector('.drag-grabber').id = `${id}header`;
+    const close = win.querySelector('.dragClose');
+    close.id = `${id}close`;
+    close.setAttribute('data-related-id', id);
+
+    const media = item.video ? document.createElement('video') : document.createElement('img');
+    media.src = item.url;
+    media.draggable = false;
+    if (media instanceof HTMLVideoElement) { media.controls = true; media.autoplay = true; media.loop = true; }
+    win.append(media);
+    document.getElementById('movingDivs').append(win);
+
+    if (isMobileLayout()) applySavedWindowState(win);
+    win.dataset.gppSide = side;
+
+    let shown = false;
+    const reveal = () => {
+        if (shown || !win.isConnected) return;
+        shown = true;
+        win.style.visibility = '';
+        fadeIn(win);
+    };
+    const fit = () => {
+        const w = media instanceof HTMLVideoElement ? media.videoWidth : media.naturalWidth;
+        const hgt = media instanceof HTMLVideoElement ? media.videoHeight : media.naturalHeight;
+        if (!w || !hgt) return;
+        win.dataset.gppW = String(w);
+        win.dataset.gppH = String(hgt);
+        fitImageWindow(win, win.dataset.gppSide === 'left' ? 'left' : 'right');
+        reveal();
+    };
+    media.addEventListener(media instanceof HTMLVideoElement ? 'loadedmetadata' : 'load', fit, { once: true });
+    media.addEventListener('error', reveal, { once: true }); // broken file: show the (default-sized) window anyway
+    setTimeout(reveal, 3000); // safety net for a very slow server
+
+    dragElement($(win));
+    fitImageWindow(win, side); // provisional placement while hidden
+    if (media instanceof HTMLImageElement && media.complete) fit(); // cached picture: size is known right now
+}
+
+function closeAllImages() {
+    document.querySelectorAll('.galleryImageDraggable .dragClose').forEach(btn => /** @type {HTMLElement} */ (btn).click());
+}
+
+// ------------------------------------------------------------------------------- hotkeys
+
+function isTyping() {
+    const el = document.activeElement;
+    if (!(el instanceof HTMLElement)) return false;
+    return el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement
+        || el.isContentEditable || Boolean(el.closest('[contenteditable="true"]'));
+}
+
+function onHotkey(event) {
+    if (!getBoolean('hotkeys')) return;
+    if (event.isComposing || event.defaultPrevented || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return;
+    if (isTyping() || Popup.util.isPopupOpen()) return;
+
+    switch (event.key) {
+        case '\\': toggleGallery(); break;
+        case '=': closeAllImages(); break;
+        case '[': if (!view.panel) return; goToPage(view.page - 1); break;
+        case ']': if (!view.panel) return; goToPage(view.page + 1); break;
+        default: return;
     }
     event.preventDefault();
 }
 
-function addGalleryWandButton() {
-    const showGalleryContainer = document.getElementById('gallery_wand_container') || document.getElementById('extensionsMenu');
-    if (!(showGalleryContainer instanceof HTMLElement)) {
-        return;
-    }
-    if (document.getElementById('show_gallery_wand_button')) {
-        return;
-    }
-    const showGalleryButton = document.createElement('div');
-    showGalleryButton.id = 'show_gallery_wand_button';
-    showGalleryButton.classList.add('list-group-item', 'flex-container', 'flexGap5');
-    const showGalleryIcon = document.createElement('div');
-    showGalleryIcon.classList.add('fa-solid', 'fa-sd-card', 'extensionsMenuExtensionButton');
-    const showGalleryText = document.createElement('span');
-    showGalleryText.textContent = translate('Show Gallery');
-    showGalleryButton.appendChild(showGalleryIcon);
-    showGalleryButton.appendChild(showGalleryText);
-    showGalleryButton.addEventListener('click', () => {
-        showCharGallery();
+// ------------------------------------------------------------------------------- Extensions-tab settings
+
+function mountSettings() {
+    if (document.getElementById('gpp_settings')) return;
+    const host = document.getElementById('extensions_settings2') ?? document.getElementById('extensions_settings');
+    if (!host) { console.warn('[Gallery++] Extensions settings container not found'); return; }
+
+    const inputs = {};
+    const summary = h('small', { class: 'gpp-settings-summary' });
+
+    const refreshSummary = () => {
+        const l = currentLayout();
+        const shape = l.aspect === 'auto' ? t`shape detected per gallery` : `${l.aspect} ${t`shape`}`;
+        summary.textContent = `${l.pageSize} ${t`images per page`} (${l.cols} ${t`columns`} × ${l.rows} ${t`rows`}), ${shape}. ${t`Pictures are sized to fit beside the chat.`}`;
+    };
+
+    const applyField = debounce((key) => {
+        const { min, max } = LAYOUT_LIMITS[key];
+        if (inputs[key].value.trim() === '') return; // still typing
+        const value = clampInt(inputs[key].value, min, max, LAYOUT_DEFAULTS[key]);
+        setLayout({ [key]: value });
+        refreshSummary();
+        applyLayoutToOpenGallery();
+    }, 250);
+
+    const numberField = (key, label, unit) => {
+        const { min, max } = LAYOUT_LIMITS[key];
+        inputs[key] = h('input', { type: 'number', class: 'text_pole gpp-number', min, max, step: 1, value: String(getLayout()[key]), 'aria-label': label });
+        inputs[key].addEventListener('input', () => applyField(key));
+        inputs[key].addEventListener('change', () => {
+            applyField.cancel();
+            const normalized = clampInt(inputs[key].value, min, max, LAYOUT_DEFAULTS[key]);
+            inputs[key].value = String(normalized); // show the corrected value
+            setLayout({ [key]: normalized });
+            refreshSummary();
+            applyLayoutToOpenGallery();
+        });
+        return h('label', { class: 'gpp-field' },
+            h('span', {}, label), h('span', { class: 'gpp-field-input' }, inputs[key], unit ? h('small', {}, unit) : null),
+            h('small', { class: 'gpp-range' }, `${min}–${max}`));
+    };
+
+    const aspectField = () => {
+        const select = h('select', { class: 'text_pole gpp-select', 'aria-label': t`Picture shape` });
+        select.append(h('option', { value: 'auto' }, t`Auto (match each gallery)`),
+            ...ASPECT_PRESETS.map(p => h('option', { value: p.value }, p.label)));
+        select.value = getLayout().aspect;
+        select.addEventListener('change', () => {
+            setLayout({ aspect: select.value });
+            refreshSummary();
+            applyLayoutToOpenGallery();
+        });
+        inputs.aspect = select;
+        return h('label', { class: 'gpp-field' }, h('span', {}, t`Picture shape`), select, h('small', { class: 'gpp-range' }, t`width : height`));
+    };
+
+    const checkbox = (key, label) => {
+        const input = h('input', { type: 'checkbox', checked: getBoolean(key) });
+        input.addEventListener('change', () => {
+            setBoolean(key, input.checked);
+            if (key === 'showNames' && view.panel) view.refs.grid.classList.toggle('gpp-show-names', input.checked);
+        });
+        return h('label', { class: 'checkbox_label' }, input, h('span', {}, label));
+    };
+
+    const resetButton = h('div', { class: 'menu_button menu_button_icon interactable', role: 'button' }, icon('fa-solid fa-rotate-left'), h('span', {}, t`Reset layout`));
+    resetButton.addEventListener('click', () => {
+        const layout = resetLayout();
+        for (const key of Object.keys(layout)) inputs[key].value = String(layout[key]);
+        refreshSummary();
+        applyLayoutToOpenGallery();
     });
-    showGalleryContainer.appendChild(showGalleryButton);
+    const clearButton = h('div', { class: 'menu_button menu_button_icon interactable', role: 'button', title: t`Thumbnails are regenerated the next time you open a folder` }, icon('fa-solid fa-broom'), h('span', {}, t`Clear thumbnail cache`));
+    clearButton.addEventListener('click', async () => {
+        const removed = await clearThumbnailCache();
+        toastr.success(`${t`Thumbnail cache cleared`} (${removed})`);
+        if (view.panel) renderPage();
+    });
+    const openButton = h('div', { class: 'menu_button menu_button_icon interactable', role: 'button' }, icon('fa-solid fa-sd-card'), h('span', {}, t`Open gallery`));
+    openButton.addEventListener('click', () => void openGallery());
+
+    const content = h('div', { class: 'inline-drawer-content' },
+        h('div', { class: 'gpp-settings-grid' },
+            numberField('rows', t`Rows per page`),
+            numberField('cols', t`Columns per page`),
+            aspectField()),
+        summary,
+        checkbox('showNames', t`Always show file names on pictures`),
+        checkbox('hotkeys', t`Keyboard shortcuts:  [  ]  page ·  \\  toggle ·  =  close pictures`),
+        h('div', { class: 'flex-container gpp-settings-buttons' }, openButton, resetButton, clearButton));
+
+    const drawer = h('div', { id: 'gpp_settings', class: 'gpp-settings' },
+        h('div', { class: 'inline-drawer' },
+            h('div', { class: 'inline-drawer-toggle inline-drawer-header' },
+                h('b', {}, 'Gallery++'),
+                h('div', { class: 'inline-drawer-icon fa-solid fa-circle-chevron-down down' })),
+            content));
+    host.append(drawer);
+    refreshSummary();
 }
 
-// On extension load, ensure the settings are initialized
-export async function init() {
-    if (galleryInitialized) return;
-    galleryInitialized = true;
+// ------------------------------------------------------------------------------- slash commands
 
-    initSettings();
-    document.addEventListener('keydown', handleGalleryHotkeys, { passive: false });
+function registerCommands() {
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'show-gallery',
+        aliases: ['sg'],
+        callback: () => { void openGallery(); return ''; },
+        helpString: 'Shows the gallery.',
+    }));
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'list-gallery',
+        aliases: ['lg'],
+        callback: listGalleryCommand,
+        returns: 'list of images',
+        namedArgumentList: [
+            SlashCommandNamedArgument.fromProps({ name: 'char', description: 'character name', typeList: [ARGUMENT_TYPE.STRING], enumProvider: commonEnumProviders.characters('character') }),
+            SlashCommandNamedArgument.fromProps({ name: 'group', description: 'group name', typeList: [ARGUMENT_TYPE.STRING], enumProvider: commonEnumProviders.characters('group') }),
+        ],
+        helpString: 'List images in the gallery of the current char / group or a specified char / group.',
+    }));
+}
 
-    // Warm the gallery assets during idle time; the first click shares this load.
-    const preloadGalleryAssets = () => {
-        void loadGalleryAssets().catch(error => {
-            console.warn('Gallery asset preload failed; assets will retry on open:', error);
-        });
-    };
-    if (typeof window.requestIdleCallback === 'function') {
-        window.requestIdleCallback(preloadGalleryAssets, { timeout: 3000 });
-    } else {
-        window.setTimeout(preloadGalleryAssets, 1500);
+async function listGalleryCommand(args) {
+    try {
+        const ctx = SillyTavern.getContext();
+        let folder;
+        if (args.char) {
+            const character = ctx.characters?.find(c => c.name === args.char);
+            folder = character ? resolveCharacterFolder(character) : args.char;
+        } else if (args.group) {
+            folder = ctx.groups?.find(g => g.name == args.group)?.id;
+        } else {
+            folder = getTarget()?.folder;
+        }
+        if (!folder) return JSON.stringify([]);
+        const items = await fetchItems(String(folder));
+        return JSON.stringify(items.map(i => i.path));
+    } catch (error) {
+        console.error('[Gallery++]', error);
+        return JSON.stringify([]);
     }
-    eventSource.on(event_types.CHARACTER_RENAMED, (oldAvatar, newAvatar) => {
-        const context = SillyTavern.getContext();
-        const galleryFolder = context.extensionSettings.gallery.folders[oldAvatar];
-        if (galleryFolder) {
-            context.extensionSettings.gallery.folders[newAvatar] = galleryFolder;
-            delete context.extensionSettings.gallery.folders[oldAvatar];
-            context.saveSettingsDebounced();
-        }
+}
+
+// ------------------------------------------------------------------------------- menu entries
+
+function addMenuEntries() {
+    const dropdown = document.getElementById('char-management-dropdown');
+    if (dropdown && !document.getElementById('gpp_show_gallery_option')) {
+        dropdown.append(h('option', { id: 'gpp_show_gallery_option' }, `${translate('Show Gallery')}++`));
+    }
+    const wand = document.getElementById('gallery_wand_container') ?? document.getElementById('extensionsMenu');
+    if (wand && !document.getElementById('gpp_wand_button')) {
+        const button = h('div', { id: 'gpp_wand_button', class: 'list-group-item flex-container flexGap5' },
+            h('div', { class: 'fa-solid fa-sd-card extensionsMenuExtensionButton' }), h('span', {}, `${translate('Show Gallery')}++`));
+        button.addEventListener('click', () => void openGallery());
+        wand.append(button);
+    }
+}
+
+// ------------------------------------------------------------------------------- bootstrap
+
+export async function init() {
+    if (initialized) return;
+    initialized = true;
+
+    configureSettings({
+        getRoot: () => SillyTavern.getContext().extensionSettings,
+        saveDebounced: () => SillyTavern.getContext().saveSettingsDebounced(),
+        saveNow: typeof ST.saveSettings === 'function' ? () => ST.saveSettings() : undefined,
+        storage: (() => { try { return window.localStorage; } catch { return null; } })(),
     });
-    eventSource.on(event_types.CHARACTER_DELETED, (data) => {
-        const avatar = data?.character?.avatar;
-        if (!avatar) return;
-        const context = SillyTavern.getContext();
-        delete context.extensionSettings.gallery.folders[avatar];
-        context.saveSettingsDebounced();
-    });
-    eventSource.on(event_types.CHARACTER_MANAGEMENT_DROPDOWN, (selectedOptionId) => {
-        if (selectedOptionId === 'show_char_gallery') {
-            showCharGallery();
-        }
+    getSettings(); // validates, migrates from the original Gallery, and restores folder assignments
+
+    // Closing windows. ST has no global handler for generic draggables.
+    $('#movingDivs').on('click', '.gpp-panel .dragClose, .galleryImageDraggable .dragClose', function () {
+        const target = $(this).closest('.draggable')[0];
+        if (!target) return;
+        if (target === view.panel) closeGallery();
+        else fadeRemove(target);
     });
 
-    // Add an option to the dropdown
-    $('#char-management-dropdown').append(
-        $('<option>', {
-            id: 'show_char_gallery',
-            text: translate('Show Gallery'),
-        }),
-    );
-    addGalleryWandButton();
+    document.addEventListener('keydown', onHotkey);
+
+    // Keep every gallery window fitted beside the chat panel when the screen or chat width changes.
+    const refit = debounce(fitAllWindows, 60);
+    window.addEventListener('resize', refit);
+    const sheld = document.getElementById('sheld');
+    if (sheld && typeof ResizeObserver === 'function') new ResizeObserver(refit).observe(sheld);
+    const afterDrag = () => setTimeout(rememberDraggedSides, 0);
+    document.addEventListener('mouseup', afterDrag);
+    document.addEventListener('touchend', afterDrag);
+    eventSource.on(event_types.CHAT_CHANGED, () => void syncToContext());
+    eventSource.on(event_types.CHARACTER_RENAMED, (oldAvatar, newAvatar) => renameAvatar(oldAvatar, newAvatar));
+    eventSource.on(event_types.CHARACTER_DELETED, (data) => removeAvatar(data?.character?.avatar));
+    eventSource.on(event_types.CHARACTER_MANAGEMENT_DROPDOWN, (id) => { if (id === 'gpp_show_gallery_option') void openGallery(); });
+
+    registerCommands();
+    addMenuEntries();
+    mountSettings();
 }
