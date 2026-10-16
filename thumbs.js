@@ -5,6 +5,9 @@
  * - Thumbnails are small WebP blobs persisted in IndexedDB, so revisiting a folder never re-downloads
  *   full-size images.
  * - A bounded in-memory LRU gives synchronous hits when flipping back and forth between pages.
+ * - Every cached thumbnail remembers a "version signature" of the file it was made from (ETag /
+ *   Last-Modified / size, read with a cheap HEAD request). When the file on the server has changed, the
+ *   stale thumbnail is discarded and regenerated, so replaced or edited images never show old previews.
  * - Decoding is limited to a few concurrent jobs, and queued jobs are dropped when their tile has been
  *   scrolled away or the page changed (AbortSignal), so fast page flipping never builds a backlog.
  */
@@ -21,9 +24,14 @@ const MEMORY_LIMIT = 400;
 const CONCURRENCY = 3;
 const VIDEO_TIMEOUT_MS = 15_000;
 const WEBP_QUALITY = 0.82;
+const SIGNATURE_TTL_MS = 30_000; // how long a checked signature is trusted before re-checking the server
 
-/** @type {Map<string, Blob>} insertion-ordered LRU */
+/** @type {Map<string, {blob: Blob, v: string|null}>} insertion-ordered LRU */
 const memory = new Map();
+/** @type {Map<string, {sig: string|null, time: number}>} last server signature seen per file URL */
+const signatures = new Map();
+/** @type {Map<string, Promise<string|null>>} */
+const signatureInFlight = new Map();
 /** @type {Map<string, Promise<Blob|null>>} */
 const inFlight = new Map();
 /** @type {Array<{run: () => Promise<void>, signal?: AbortSignal, cancel: () => void}>} */
@@ -35,9 +43,9 @@ let dbPromise = null;
 
 const keyOf = (src, bucket) => `${src}|${bucket}`;
 
-function remember(key, blob) {
+function remember(key, blob, v = null) {
     memory.delete(key);
-    memory.set(key, blob);
+    memory.set(key, { blob, v });
     while (memory.size > MEMORY_LIMIT) {
         memory.delete(memory.keys().next().value);
     }
@@ -81,18 +89,18 @@ async function dbGet(key) {
     try {
         const db = await openDB();
         const row = await wrap(db.transaction(STORE, 'readonly').objectStore(STORE).get(key));
-        return row?.blob instanceof Blob ? row.blob : null;
+        return row?.blob instanceof Blob ? { blob: row.blob, v: row.v ?? null } : null;
     } catch {
         return null;
     }
 }
 
-async function dbPut(key, blob) {
+async function dbPut(key, blob, v) {
     try {
         const db = await openDB();
         await new Promise((resolve, reject) => {
             const tx = db.transaction(STORE, 'readwrite');
-            tx.objectStore(STORE).put({ blob, t: Date.now() }, key);
+            tx.objectStore(STORE).put({ blob, v: v ?? null, t: Date.now() }, key);
             tx.oncomplete = resolve;
             tx.onerror = () => reject(tx.error);
             tx.onabort = () => reject(tx.error ?? new Error('aborted'));
@@ -166,6 +174,48 @@ function pump() {
     }
 }
 
+// ------------------------------------------------------------------------ change detection
+
+/**
+ * Asks the server what version of a file is current. Resolves null when it cannot be told (network error,
+ * missing validators), in which case the cached thumbnail is simply trusted.
+ * Results are shared between callers and reused for SIGNATURE_TTL_MS.
+ * @param {string} src
+ * @returns {Promise<string|null>}
+ */
+function currentSignature(src) {
+    const known = signatures.get(src);
+    if (known && Date.now() - known.time < SIGNATURE_TTL_MS) return Promise.resolve(known.sig);
+    let promise = signatureInFlight.get(src);
+    if (!promise) {
+        promise = (async () => {
+            try {
+                // `no-cache` forces revalidation, so a stale HTTP-cache entry can't hide a change.
+                const response = await fetch(src, { method: 'HEAD', credentials: 'same-origin', cache: 'no-cache' });
+                if (!response.ok) return null;
+                const h = response.headers;
+                const parts = [h.get('etag'), h.get('last-modified'), h.get('content-length')];
+                return parts.some(Boolean) ? parts.map(p => p ?? '').join('|') : null;
+            } catch {
+                return null;
+            }
+        })().then(sig => {
+            if (sig !== null) signatures.set(src, { sig, time: Date.now() });
+            return sig;
+        }).finally(() => signatureInFlight.delete(src));
+        signatureInFlight.set(src, promise);
+    }
+    return promise;
+}
+
+/** A cached entry is current unless the server reports a different (or, for old rows, an unknown) version. */
+const isCurrent = (entry, sig) => sig === null || entry.v === sig;
+
+/** Forgets checked signatures, so the next lookups re-verify against the server (e.g. when a folder is (re)opened). */
+export function invalidateThumbnailChecks() {
+    signatures.clear();
+}
+
 // ----------------------------------------------------------------------------- generation
 
 async function decode(blob) {
@@ -199,7 +249,7 @@ async function canvasToWebp(canvas) {
 }
 
 async function renderImageThumbnail(src, bucket, signal) {
-    const response = await fetch(src, { credentials: 'same-origin', signal });
+    const response = await fetch(src, { credentials: 'same-origin', cache: 'no-cache', signal });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const original = await response.blob();
     const decoded = await decode(original);
@@ -243,8 +293,19 @@ async function renderVideoThumbnail(src, bucket) {
 export function peekThumbnail(src, bucket) {
     const key = keyOf(src, bucket);
     const hit = memory.get(key);
-    if (hit) remember(key, hit);
-    return hit ?? null;
+    if (hit) remember(key, hit.blob, hit.v);
+    return hit?.blob ?? null;
+}
+
+/**
+ * Whether the thumbnail for this file was already checked against the server recently, i.e. whether
+ * a synchronous {@link peekThumbnail} hit can be trusted without another look.
+ * @param {string} src @param {number} bucket
+ */
+export function isThumbnailVerified(src, bucket) {
+    const entry = memory.get(keyOf(src, bucket));
+    const known = signatures.get(src);
+    return !!entry && !!known && Date.now() - known.time < SIGNATURE_TTL_MS && entry.v === known.sig;
 }
 
 /**
@@ -256,22 +317,29 @@ export function peekThumbnail(src, bucket) {
  */
 export async function getThumbnail(src, { video, bucket, signal }) {
     const key = keyOf(src, bucket);
-    const mem = memory.get(key);
-    if (mem) { remember(key, mem); return mem; }
 
-    const stored = await dbGet(key);
-    if (stored) { remember(key, stored); return stored; }
+    const cached = memory.get(key) ?? await dbGet(key);
+    if (cached) {
+        const sig = await currentSignature(src);
+        if (isCurrent(cached, sig)) {
+            remember(key, cached.blob, cached.v);
+            return cached.blob;
+        }
+        // The file changed on the server: drop the stale thumbnail and fall through to regenerate it.
+        memory.delete(key);
+    }
     if (signal?.aborted) return null;
 
     let promise = inFlight.get(key);
     if (!promise) {
         promise = enqueue(async () => {
+            const sig = await currentSignature(src);
             const blob = video
                 ? await renderVideoThumbnail(src, bucket)
                 : await renderImageThumbnail(src, bucket, signal);
             if (blob) {
-                remember(key, blob);
-                await dbPut(key, blob);
+                remember(key, blob, sig);
+                await dbPut(key, blob, sig);
             }
             return blob;
         }, signal)
@@ -287,6 +355,7 @@ export async function getThumbnail(src, { video, bucket, signal }) {
 
 /** Removes every cached size of one file (after it was deleted). */
 export async function purgeThumbnail(src) {
+    signatures.delete(src);
     for (const key of [...memory.keys()]) {
         if (key.startsWith(`${src}|`)) memory.delete(key);
     }
@@ -303,9 +372,34 @@ export async function purgeThumbnail(src) {
     }
 }
 
+/** Removes every cached size of many files at once (one transaction). Used by the refresh button. */
+export async function purgeThumbnails(srcs) {
+    const list = [...new Set(srcs)];
+    for (const src of list) signatures.delete(src);
+    const prefixes = list.map(src => `${src}|`);
+    for (const key of [...memory.keys()]) {
+        if (prefixes.some(prefix => key.startsWith(prefix))) memory.delete(key);
+    }
+    if (list.length === 0) return;
+    try {
+        const db = await openDB();
+        await new Promise((resolve, reject) => {
+            const tx = db.transaction(STORE, 'readwrite');
+            const store = tx.objectStore(STORE);
+            for (const src of list) store.delete(IDBKeyRange.bound(`${src}|`, `${src}|\uffff`));
+            tx.oncomplete = resolve;
+            tx.onerror = () => reject(tx.error);
+            tx.onabort = () => reject(tx.error ?? new Error('aborted'));
+        });
+    } catch (error) {
+        console.debug('[Gallery++] Could not purge thumbnails:', error);
+    }
+}
+
 /** Empties both cache layers. Returns the number of persisted entries removed. */
 export async function clearThumbnailCache() {
     memory.clear();
+    signatures.clear();
     try {
         const db = await openDB();
         const count = await wrap(db.transaction(STORE, 'readonly').objectStore(STORE).count());

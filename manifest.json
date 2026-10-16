@@ -6,7 +6,7 @@
     "js": "index.js",
     "css": "style.css",
     "author": "City-Unit / Gallery++ community fork",
-    "version": "2.0.4",
+    "version": "2.0.5",
     "homePage": "https://github.com/serioos/Gallery-Plus-Plus",
     "auto_update": true,
     "minimum_client_version": "1.17.0",

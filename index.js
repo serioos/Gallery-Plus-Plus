@@ -27,7 +27,7 @@ import {
     resetLayout, resolveCharacterFolder, setBoolean, setFolderOverride, setLayout, setSide, setSort,
     getFolderOverride,
 } from './settings.js';
-import { clearThumbnailCache, getThumbnail, peekThumbnail, purgeThumbnail } from './thumbs.js';
+import { clearThumbnailCache, getThumbnail, invalidateThumbnailChecks, isThumbnailVerified, peekThumbnail, purgeThumbnail, purgeThumbnails } from './thumbs.js';
 
 // ------------------------------------------------------------------------------- constants
 
@@ -107,7 +107,7 @@ function fadeIn(element) {
 
 /**
  * @typedef {{path: string, url: string, name: string, nameLower: string, video: boolean}} GalleryItem
- * @typedef {{el: HTMLElement, img: HTMLImageElement, item: GalleryItem, objectUrl: string|null}} Tile
+ * @typedef {{el: HTMLElement, img: HTMLImageElement, item: GalleryItem, objectUrl: string|null, blob?: Blob}} Tile
  */
 
 const view = {
@@ -225,6 +225,7 @@ function revealPanel() {
  */
 async function loadFolder({ keepPage = false, previousPaths = null } = {}) {
     if (!view.panel) return;
+    invalidateThumbnailChecks(); // re-verify cached thumbnails against the server whenever a folder is (re)loaded
     const token = ++view.token;
     view.loadCtl?.abort();
     const ctl = (view.loadCtl = new AbortController());
@@ -453,9 +454,11 @@ function renderPage() {
             fragment.append(el);
 
             // Instant paint for thumbnails already in memory.
+            // A hit that hasn't been checked against the server yet is still shown right away, but is also
+            // queued so it gets swapped out if the file changed.
             const hit = peekThumbnail(item.url, bucket);
             if (hit) applyThumbnail(tile, hit);
-            else pending.push(tile);
+            if (!hit || !isThumbnailVerified(item.url, bucket)) pending.push(tile);
         }
         grid.replaceChildren(fragment);
 
@@ -483,9 +486,10 @@ function renderPage() {
 
 /** @param {Tile} tile @param {Blob} blob */
 function applyThumbnail(tile, blob) {
-    if (!view.tiles.has(tile.el)) return;
+    if (!view.tiles.has(tile.el) || tile.blob === blob) return;
     if (tile.objectUrl) URL.revokeObjectURL(tile.objectUrl);
     tile.objectUrl = URL.createObjectURL(blob);
+    tile.blob = blob;
     tile.img.src = tile.objectUrl;
     tile.el.classList.add('gpp-loaded');
 }
@@ -773,9 +777,10 @@ function buildPanel() {
         title: t`Enter a folder name to assign it to this character`, spellcheck: 'false', autocomplete: 'off',
     });
     refs.folderAccept = h('div', { class: 'right_menu_button fa-solid fa-check fa-fw', title: t`Assign this folder to the character`, role: 'button' });
+    refs.refreshButton = h('div', { class: 'right_menu_button fa-solid fa-arrows-rotate fa-fw gpp-refresh', title: t`Refresh the gallery and rebuild all thumbnails`, role: 'button' });
     refs.deleteToggle = h('div', { class: 'right_menu_button fa-solid fa-trash fa-fw', title: t`Delete mode`, role: 'button', 'aria-pressed': 'false' });
     refs.folderRestore = h('div', { class: 'right_menu_button fa-solid fa-recycle fa-fw', title: t`Restore the default gallery folder`, role: 'button' });
-    const folderRow = h('div', { class: 'gpp-row' }, refs.folderInput, refs.folderAccept, refs.deleteToggle, refs.folderRestore);
+    const folderRow = h('div', { class: 'gpp-row' }, refs.folderInput, refs.folderAccept, refs.refreshButton, refs.deleteToggle, refs.folderRestore);
 
     // --- search / sort / side / add row
     refs.search = h('input', { type: 'search', class: 'text_pole gpp-search', placeholder: t`Search by name…`, 'aria-label': t`Search images by name`, spellcheck: 'false', autocomplete: 'off' });
@@ -964,6 +969,7 @@ function wirePanel(panel) {
     const submitFolder = () => void applyFolderChoice(r.folderInput.value);
     r.folderAccept.addEventListener('click', submitFolder);
     r.folderRestore.addEventListener('click', () => void restoreDefaultFolder());
+    r.refreshButton.addEventListener('click', () => void refreshGallery());
     r.deleteToggle.addEventListener('click', () => setDeleteMode(!view.deleteMode));
     wireFolderSuggestions(r.folderInput, submitFolder);
 
@@ -1066,6 +1072,30 @@ async function uploadFiles(files) {
     if (ok) toastr.success(`${t`Uploaded`} ${ok} ${ok === 1 ? t`file` : t`files`}.`);
     if (failed) toastr.error(`${t`Failed to upload`} ${failed} ${failed === 1 ? t`file` : t`files`}.`);
     if (view.panel && view.folder === folder) await loadFolder({ previousPaths: before });
+}
+
+let refreshing = false;
+
+/** Re-lists the folder and throws away every cached thumbnail of it, so all of them are rebuilt from the files. */
+async function refreshGallery() {
+    if (!view.panel || refreshing) return;
+    refreshing = true;
+    const button = view.refs.refreshButton;
+    button.classList.add('fa-spin', 'disabled');
+    const folder = view.folder;
+    try {
+        view.renderCtl?.abort(); // stop thumbnail work for the old tiles
+        await purgeThumbnails(view.items.map(i => i.url));
+        for (const key of [...aspectCache.keys()]) {
+            if (key.startsWith(`${folder}|`)) aspectCache.delete(key);
+        }
+        foldersCache = { time: 0, list: null };
+        await loadFolder({ keepPage: true });
+        if (view.panel && view.folder === folder && view.status === 'ready') toastr.success(t`Gallery refreshed`);
+    } finally {
+        refreshing = false;
+        button.classList.remove('fa-spin', 'disabled');
+    }
 }
 
 let folderBusy = false;

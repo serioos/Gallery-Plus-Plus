@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.0.5
+- **New refresh button** (next to the assign-folder check mark): re-lists the folder and rebuilds every thumbnail in it from the actual files.
+- **Changed images now get fresh thumbnails.** Each cached thumbnail remembers the version of the file it was made from (ETag / Last-Modified / size, read with a lightweight HEAD request). When a gallery is opened, cached thumbnails are shown instantly, then checked against the server; any whose image changed are regenerated and swapped in automatically. Only the changed images are re-cached.
+- Thumbnail generation now bypasses the browser's HTTP cache so it can't rebuild a thumbnail from a stale copy of the image.
+- Thumbnails cached by older versions have no version info and are regenerated once on first view.
+
 ## 2.0.4
 - The gallery window now sits flush against the chat panel and the bottom edge of the screen, exactly like opened pictures, and hugs its grid.
 - **No more flash of a small window.** Opened pictures stay invisible until their real size is known (previously a 320x320 placeholder faded in and then jumped to the picture's size). The gallery window itself also appears only once, at its final size.
