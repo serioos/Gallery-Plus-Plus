@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.0.6
+- **New option: "Esc never closes opened pictures or the gallery"** (Extensions tab > Gallery++).
+- **Fixed:** pressing Esc to cancel a message edit (or to leave a text field) no longer closes opened pictures or the gallery, regardless of the option.
+- **New option: "Clean opened pictures"** (on by default). Opened pictures lose their window background, border and shadow, and the close cross and frame only appear while the pointer is over the picture, so transparent images are shown cleanly. On touch screens the cross stays visible.
+
 ## 2.0.5
 - **New refresh button** (next to the assign-folder check mark): re-lists the folder and rebuilds every thumbnail in it from the actual files.
 - **Changed images now get fresh thumbnails.** Each cached thumbnail remembers the version of the file it was made from (ETag / Last-Modified / size, read with a lightweight HEAD request). When a gallery is opened, cached thumbnails are shown instantly, then checked against the server; any whose image changed are regenerated and swapped in automatically. Only the changed images are re-cached.

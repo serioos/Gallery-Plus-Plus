@@ -477,3 +477,43 @@
     width: 100%;
     min-width: 0;
 }
+
+/* ---------------------------------------------------------------- clean opened pictures
+   Transparent PNGs/WebPs look best without a window around them. With the option on, the frame,
+   background and close button fade in only while the pointer is over the picture. On touch screens
+   (no hover) the close button stays visible, but the frame is still removed. */
+body.gpp-clean-pictures .galleryImageDraggable {
+    background: transparent !important;
+    border-color: transparent !important;
+    box-shadow: none !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+    transition: background-color 0.15s, border-color 0.15s, box-shadow 0.15s;
+}
+
+body.gpp-clean-pictures .galleryImageDraggable .dragClose,
+body.gpp-clean-pictures .galleryImageDraggable .drag-grabber {
+    transition: opacity 0.15s;
+}
+
+body.gpp-clean-pictures .galleryImageDraggable .dragClose {
+    filter: drop-shadow(0 0 3px rgba(0, 0, 0, 0.85));
+}
+
+@media (hover: hover) {
+    body.gpp-clean-pictures .galleryImageDraggable .dragClose {
+        opacity: 0;
+    }
+
+    body.gpp-clean-pictures .galleryImageDraggable:hover,
+    body.gpp-clean-pictures .galleryImageDraggable:focus-within {
+        background: var(--SmartThemeBlurTintColor) !important;
+        border-color: var(--SmartThemeBorderColor) !important;
+        box-shadow: 0 0 8px var(--black50a, rgba(0, 0, 0, 0.5)) !important;
+    }
+
+    body.gpp-clean-pictures .galleryImageDraggable:hover .dragClose,
+    body.gpp-clean-pictures .galleryImageDraggable:focus-within .dragClose {
+        opacity: 1;
+    }
+}

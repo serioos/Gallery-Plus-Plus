@@ -105,6 +105,8 @@ export function getSettings() {
     if (s.side !== 'left' && s.side !== 'right') { s.side = 'left'; changed = true; }
     if (typeof s.hotkeys !== 'boolean') { s.hotkeys = true; changed = true; }
     if (typeof s.showNames !== 'boolean') { s.showNames = false; changed = true; }
+    if (typeof s.escKeepsOpen !== 'boolean') { s.escKeepsOpen = false; changed = true; }
+    if (typeof s.cleanPictures !== 'boolean') { s.cleanPictures = true; changed = true; }
 
     for (const stale of ['thumbWidth', 'thumbHeight']) { // replaced by the aspect-ratio option
         if (stale in s) { delete s[stale]; changed = true; }
@@ -260,7 +262,7 @@ export function setSide(side) {
 
 export function getBoolean(key) { return Boolean(getSettings()[key]); }
 export function setBoolean(key, value) {
-    if (key !== 'hotkeys' && key !== 'showNames') return;
+    if (!['hotkeys', 'showNames', 'escKeepsOpen', 'cleanPictures'].includes(key)) return;
     getSettings()[key] = Boolean(value);
     commit();
 }

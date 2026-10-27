@@ -1037,7 +1037,7 @@ async function deleteItem(item) {
     if (!deleted) return;
     toastr.success(t`Image deleted successfully.`);
     void purgeThumbnail(item.url);
-    $(`.galleryImageDraggable[data-src="${CSS.escape(item.url)}"] .dragClose`).trigger('click');
+    $(`.galleryImageDraggable[data-src="${CSS.escape(item.url)}"] .dragClose`).each((_, btn) => forceClose(btn));
     // Update locally; no need to re-list the whole folder.
     view.items = view.items.filter(i => i.path !== item.path);
     applyFilter();
@@ -1316,8 +1316,53 @@ function openMedia(item, side) {
     if (media instanceof HTMLImageElement && media.complete) fit(); // cached picture: size is known right now
 }
 
+/** Closes a window through its close button on purpose (bypasses the Escape guard below). */
+function forceClose(button) {
+    allowSyntheticClose = true;
+    try { $(button).trigger('click'); } finally { allowSyntheticClose = false; }
+}
+
 function closeAllImages() {
-    document.querySelectorAll('.galleryImageDraggable .dragClose').forEach(btn => /** @type {HTMLElement} */ (btn).click());
+    document.querySelectorAll('.galleryImageDraggable .dragClose').forEach(btn => forceClose(btn));
+}
+
+// ------------------------------------------------------------------------------- Escape guard
+//
+// SillyTavern closes floating windows when Escape is pressed, by "clicking" their close button from script.
+// That click is not a real mouse click, so Gallery++ can tell it apart and refuse it when it should not
+// close anything:
+//   - the "Escape does not close pictures / gallery" option is on, or
+//   - Escape was used for something else: cancelling a message edit, or leaving a text field.
+// SillyTavern removes the edit box while handling the same key press, so the state is captured *before*
+// SillyTavern sees the event (capture phase on window).
+
+const ESCAPE_WINDOW_MS = 400;
+let lastEscape = { time: 0, protect: false };
+let allowSyntheticClose = false;
+
+function escapeIsForSomethingElse() {
+    if (document.querySelector('#curEditTextarea')) return true; // editing a chat message
+    return isTyping();
+}
+
+function onEscapeCapture(event) {
+    if (event.key !== 'Escape') return;
+    lastEscape = {
+        time: performance.now(),
+        protect: getBoolean('escKeepsOpen') || escapeIsForSomethingElse(),
+    };
+}
+
+/** True when this close-button click should be ignored. */
+function shouldBlockClose(event) {
+    if (allowSyntheticClose) return false;
+    if (event.originalEvent?.isTrusted) return false; // a real click by the user
+    return lastEscape.protect && performance.now() - lastEscape.time < ESCAPE_WINDOW_MS;
+}
+
+/** Frame and close button of opened pictures appear only on hover (see style.css). */
+function applyPictureStyle() {
+    document.body.classList.toggle('gpp-clean-pictures', getBoolean('cleanPictures'));
 }
 
 // ------------------------------------------------------------------------------- hotkeys
@@ -1405,6 +1450,7 @@ function mountSettings() {
         input.addEventListener('change', () => {
             setBoolean(key, input.checked);
             if (key === 'showNames' && view.panel) view.refs.grid.classList.toggle('gpp-show-names', input.checked);
+            if (key === 'cleanPictures') applyPictureStyle();
         });
         return h('label', { class: 'checkbox_label' }, input, h('span', {}, label));
     };
@@ -1432,6 +1478,8 @@ function mountSettings() {
             aspectField()),
         summary,
         checkbox('showNames', t`Always show file names on pictures`),
+        checkbox('cleanPictures', t`Clean opened pictures: window frame and close button only show on hover (better for transparent images)`),
+        checkbox('escKeepsOpen', t`Esc never closes opened pictures or the gallery`),
         checkbox('hotkeys', t`Keyboard shortcuts:  [  ]  page ·  \\  toggle ·  =  close pictures`),
         h('div', { class: 'flex-container gpp-settings-buttons' }, openButton, resetButton, clearButton));
 
@@ -1519,7 +1567,12 @@ export async function init() {
     getSettings(); // validates, migrates from the original Gallery, and restores folder assignments
 
     // Closing windows. ST has no global handler for generic draggables.
-    $('#movingDivs').on('click', '.gpp-panel .dragClose, .galleryImageDraggable .dragClose', function () {
+    $('#movingDivs').on('click', '.gpp-panel .dragClose, .galleryImageDraggable .dragClose', function (event) {
+        if (shouldBlockClose(event)) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            return;
+        }
         const target = $(this).closest('.draggable')[0];
         if (!target) return;
         if (target === view.panel) closeGallery();
@@ -1527,6 +1580,8 @@ export async function init() {
     });
 
     document.addEventListener('keydown', onHotkey);
+    window.addEventListener('keydown', onEscapeCapture, true);
+    applyPictureStyle();
 
     // Keep every gallery window fitted beside the chat panel when the screen or chat width changes.
     const refit = debounce(fitAllWindows, 60);
