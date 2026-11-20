@@ -23,6 +23,9 @@ export const LAYOUT_DEFAULTS = Object.freeze({
     aspect: 'auto',
 });
 
+/** Coarse thumbnail resolution buckets (longest side in px). Fewer buckets mean higher cache hit rates. */
+export const THUMB_BUCKETS = Object.freeze([256, 512, 768, 1024]);
+
 /**
  * Coerces any value to an integer within [min, max]; falls back when it is not a finite number.
  * @param {unknown} value
@@ -169,21 +172,42 @@ export function fitTile(availW, availH, cols, rows, ratio, minSide = 24) {
 }
 
 /**
- * Thumbnail resolution bucket. Rounding up to 64px steps means small layout tweaks
- * reuse cached thumbnails, while bigger tiles / HiDPI screens get sharper ones.
+ * Picks the smallest coarse thumbnail resolution bucket that covers the rendered tile size.
+ * @param {number} width
+ * @param {number} height
+ * @param {number} [devicePixelRatio]
+ * @returns {number}
  */
 export function thumbBucket(width, height, devicePixelRatio = 1) {
     const dpr = Math.min(2, Math.max(1, Number(devicePixelRatio) || 1));
     const side = Math.max(width, height) * dpr;
-    return Math.min(1024, Math.max(128, Math.ceil(side / 64) * 64));
+    for (const bucket of THUMB_BUCKETS) {
+        if (side <= bucket) return bucket;
+    }
+    return THUMB_BUCKETS[THUMB_BUCKETS.length - 1];
 }
 
-/** @param {string} fileName @param {string[]} extensions */
+/**
+ * Pre-normalizes a list of file extensions into a lowercase Set (without leading dots) for O(1) lookups.
+ * @param {Iterable<string>} extensions
+ * @returns {Set<string>}
+ */
+export function normalizeExtensions(extensions) {
+    const set = new Set();
+    for (const e of extensions ?? []) {
+        const clean = String(e).toLowerCase().replace(/^\./, '');
+        if (clean) set.add(clean);
+    }
+    return set;
+}
+
+/** @param {string} fileName @param {Set<string>|string[]} extensions */
 export function isVideoName(fileName, extensions) {
     const lower = String(fileName).toLowerCase();
     const dot = lower.lastIndexOf('.');
     if (dot < 0) return false;
     const ext = lower.slice(dot + 1);
+    if (extensions instanceof Set) return extensions.has(ext);
     return extensions.some(e => String(e).toLowerCase().replace(/^\./, '') === ext);
 }
 
@@ -200,6 +224,102 @@ export function baseName(path) {
 
 /** Makes a string safe to use as a DOM id. */
 export function sanitizeHTMLId(text) {
-    const cleaned = String(text).replace(/\s+/g, '-').replace(/[^\x00-\x7F]/g, '-').replace(/\W/g, '');
+    const cleaned = String(text)
+        .replace(/\s+/g, '-')
+        .replace(/[^\x00-\x7F]/g, '-')
+        .replace(/[^a-zA-Z0-9_-]/g, '')
+        .replace(/-+/g, '-')
+        .replace(/^-+|-+$/g, '');
     return cleaned || 'image';
+}
+
+/**
+ * Extracts image width & height from the leading bytes of PNG, JPEG, WebP, GIF, or BMP files.
+ * Returns null if the format is unrecognized or more bytes are required.
+ * @param {Uint8Array} bytes
+ * @returns {{w: number, h: number}|null}
+ */
+export function parseImageDimensions(bytes) {
+    if (!(bytes instanceof Uint8Array) || bytes.length < 10) return null;
+    const len = bytes.length;
+    const u16be = (o) => (bytes[o] << 8) | bytes[o + 1];
+    const u16le = (o) => bytes[o] | (bytes[o + 1] << 8);
+    const u32be = (o) => ((bytes[o] << 24) | (bytes[o + 1] << 16) | (bytes[o + 2] << 8) | bytes[o + 3]) >>> 0;
+    const i32le = (o) => (bytes[o] | (bytes[o + 1] << 8) | (bytes[o + 2] << 16) | (bytes[o + 3] << 24)) | 0;
+
+    // PNG: 89 50 4E 47 0D 0A 1A 0A, IHDR width/height at offsets 16 and 20
+    if (len >= 24 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47
+        && bytes[4] === 0x0D && bytes[5] === 0x0A && bytes[6] === 0x1A && bytes[7] === 0x0A) {
+        const w = u32be(16);
+        const h = u32be(20);
+        return w > 0 && h > 0 ? { w, h } : null;
+    }
+
+    // GIF: GIF87a / GIF89a
+    if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38
+        && (bytes[4] === 0x37 || bytes[4] === 0x39) && bytes[5] === 0x61) {
+        const w = u16le(6);
+        const h = u16le(8);
+        return w > 0 && h > 0 ? { w, h } : null;
+    }
+
+    // WebP: RIFF....WEBP
+    if (len >= 30 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46
+        && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) {
+        const c0 = bytes[12], c1 = bytes[13], c2 = bytes[14], c3 = bytes[15];
+        // 'VP8 ' (lossy)
+        if (c0 === 0x56 && c1 === 0x50 && c2 === 0x38 && c3 === 0x20
+            && bytes[23] === 0x9D && bytes[24] === 0x01 && bytes[25] === 0x2A) {
+            const w = u16le(26) & 0x3FFF;
+            const h = u16le(28) & 0x3FFF;
+            return w > 0 && h > 0 ? { w, h } : null;
+        }
+        // 'VP8L' (lossless)
+        if (c0 === 0x56 && c1 === 0x50 && c2 === 0x38 && c3 === 0x4C && bytes[20] === 0x2F) {
+            const b0 = bytes[21], b1 = bytes[22], b2 = bytes[23], b3 = bytes[24];
+            const w = 1 + (b0 | ((b1 & 0x3F) << 8));
+            const h = 1 + (((b1 & 0xC0) >> 6) | (b2 << 2) | ((b3 & 0x0F) << 10));
+            return w > 0 && h > 0 ? { w, h } : null;
+        }
+        // 'VP8X' (extended)
+        if (c0 === 0x56 && c1 === 0x50 && c2 === 0x38 && c3 === 0x58) {
+            const w = 1 + (bytes[24] | (bytes[25] << 8) | (bytes[26] << 16));
+            const h = 1 + (bytes[27] | (bytes[28] << 8) | (bytes[29] << 16));
+            return w > 0 && h > 0 ? { w, h } : null;
+        }
+        return null;
+    }
+
+    // BMP: 'BM'
+    if (len >= 26 && bytes[0] === 0x42 && bytes[1] === 0x4D) {
+        const w = i32le(18);
+        const h = Math.abs(i32le(22));
+        return w > 0 && h > 0 ? { w, h } : null;
+    }
+
+    // JPEG: FF D8 ... SOF0..SOF15 (excluding DHT C4, JPG C8, DAC CC)
+    if (bytes[0] === 0xFF && bytes[1] === 0xD8) {
+        let offset = 2;
+        while (offset + 1 < len) {
+            while (offset < len && bytes[offset] !== 0xFF) offset++;
+            while (offset < len && bytes[offset] === 0xFF) offset++;
+            if (offset >= len) break;
+            const marker = bytes[offset++];
+            if (marker === 0xD9 || marker === 0xDA) break; // EOI / SOS
+            if (marker === 0x01 || (marker >= 0xD0 && marker <= 0xD8)) continue; // standalone
+            if (offset + 2 > len) break;
+            const segLen = u16be(offset);
+            if (segLen < 2) break;
+            if ((marker >= 0xC0 && marker <= 0xC3) || (marker >= 0xC5 && marker <= 0xC7)
+                || (marker >= 0xC9 && marker <= 0xCB) || (marker >= 0xCD && marker <= 0xCF)) {
+                if (offset + 7 > len) break;
+                const h = u16be(offset + 3);
+                const w = u16be(offset + 5);
+                return w > 0 && h > 0 ? { w, h } : null;
+            }
+            offset += segLen;
+        }
+    }
+
+    return null;
 }

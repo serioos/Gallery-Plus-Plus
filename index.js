@@ -1,5 +1,5 @@
 /*
- * Gallery++ 2.0 — a from-scratch rewrite of SillyTavern's Gallery extension.
+ * Gallery++ 2.1 — a from-scratch rewrite of SillyTavern's Gallery extension.
  * Original Gallery extension by City-Unit. SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
@@ -19,15 +19,19 @@ import { MEDIA_REQUEST_TYPE, VIDEO_EXTENSIONS } from '../../../constants.js';
 
 import {
     ASPECT_PRESETS, LAYOUT_DEFAULTS, LAYOUT_LIMITS, baseName, clampInt, clampPage, dominantAspect, encodePath,
-    filterByName, fitTile, isVideoName, pageCount, pageForIndex, pageSlice, parseAspect, parsePageInput, sanitizeHTMLId,
-    thumbBucket,
+    filterByName, fitTile, isVideoName, normalizeExtensions, pageCount, pageForIndex, pageSlice, parseAspect,
+    parsePageInput, sanitizeHTMLId, thumbBucket, tokenizeQuery,
 } from './lib.js';
 import {
-    configureSettings, getBoolean, getLayout, getSettings, getSide, getSort, removeAvatar, renameAvatar,
-    resetLayout, resolveCharacterFolder, setBoolean, setFolderOverride, setLayout, setSide, setSort,
-    getFolderOverride,
+    clearLocalBackup, configureSettings, getBoolean, getFolderOverride, getLayout, getSettings, getSide, getSort,
+    removeAvatar, renameAvatar, resetLayout, resolveCharacterFolder, setBoolean, setFolderOverride, setLayout,
+    setSide, setSort,
 } from './settings.js';
-import { clearThumbnailCache, getThumbnail, invalidateThumbnailChecks, isThumbnailVerified, peekThumbnail, purgeThumbnail, purgeThumbnails } from './thumbs.js';
+import {
+    clearThumbnailCache, deleteThumbnailDatabase, getThumbnail, invalidateThumbnailChecks, peekDimensions,
+    peekThumbnail, prefetchPageFromDB, probeImageDimensions, purgeFolderThumbnails, purgeThumbnail,
+    revalidateThumbnail,
+} from './thumbs.js';
 
 // ------------------------------------------------------------------------------- constants
 
@@ -38,10 +42,12 @@ const DEFAULT_TILE_SIDE = 300; // only used to size thumbnails before the first 
 const REVEAL_TIMEOUT_MS = 900; // longest a new gallery window waits (hidden) for its final shape
 const ASPECT_HINTS_KEY = 'gpp_aspect_hints'; // folder -> detected tile ratio, so reopening is instant
 const DEFAULT_RATIO = 2 / 3; // used until a gallery's dominant shape is known
-const ASPECT_SAMPLES = 18; // pictures sampled to find a gallery's dominant shape
+const ASPECT_SAMPLES = 12; // pictures sampled to find a gallery's dominant shape
 const MOBILE_BREAKPOINT = 1000;
 const SEARCH_DEBOUNCE_MS = 120;
 const FOLDERS_CACHE_TTL = 15_000;
+const VIDEO_EXT_SET = normalizeExtensions(VIDEO_EXTENSIONS);
+const HOTKEY_SET = new Set(['\\', '=', '[', ']']);
 
 const SORTS = Object.freeze([
     { value: 'nameAsc', field: 'name', order: 'asc', label: t`Name (A-Z)` },
@@ -84,7 +90,17 @@ function debounce(fn, ms) {
 
 const isMobileLayout = () => window.innerWidth <= MOBILE_BREAKPOINT;
 
+function stopVideoIn(element) {
+    const video = element?.querySelector?.('video');
+    if (video instanceof HTMLVideoElement) {
+        video.pause();
+        video.removeAttribute('src');
+        video.load();
+    }
+}
+
 function fadeRemove(element, onDone) {
+    stopVideoIn(element);
     const $el = $(element);
     const finish = () => { element.remove(); onDone?.(); };
     if (typeof $el.transition === 'function') {
@@ -103,16 +119,38 @@ function fadeIn(element) {
     }
 }
 
+/** Raises the clicked gallery or picture window above sibling gallery/picture windows (still behind ST drawers). */
+function raiseGalleryWindow(win) {
+    if (!(win instanceof HTMLElement)) return;
+    document.querySelectorAll('#gallery.gpp-raised, .galleryImageDraggable.gpp-raised')
+        .forEach(el => { if (el !== win) el.classList.remove('gpp-raised'); });
+    win.classList.add('gpp-raised');
+}
+
+function clearDesktopInlineGeometry(el) {
+    el.style.width = '';
+    el.style.height = '';
+    el.style.left = '';
+    el.style.right = '';
+    el.style.top = '';
+    el.style.bottom = '';
+    el.style.maxWidth = '';
+    el.style.maxHeight = '';
+    el.style.minWidth = '';
+    el.style.margin = '';
+}
+
 // ------------------------------------------------------------------------------- state
 
 /**
  * @typedef {{path: string, url: string, name: string, nameLower: string, video: boolean}} GalleryItem
- * @typedef {{el: HTMLElement, img: HTMLImageElement, item: GalleryItem, objectUrl: string|null, blob?: Blob}} Tile
+ * @typedef {{el: HTMLElement, img: HTMLImageElement, item: GalleryItem, url: string|null, blob: Blob|null}} Tile
  */
 
 const view = {
     /** @type {HTMLElement|null} */ panel: null,
     /** @type {Record<string, any>} */ refs: {},
+    /** @type {AbortController|null} */ panelCtl: null,
     token: 0,
     /** @type {AbortController|null} */ loadCtl: null,
     /** @type {AbortController|null} */ renderCtl: null,
@@ -122,6 +160,7 @@ const view = {
     /** @type {GalleryItem[]} */ items: [],
     /** @type {GalleryItem[]} */ filtered: [],
     query: '',
+    queryTokensKey: '',
     page: 1,
     pageSize: 1,
     /** @type {Map<HTMLElement, Tile>} */ tiles: new Map(),
@@ -129,6 +168,7 @@ const view = {
     deleteMode: false,
     uploading: false,
     /** @type {{tw: number, th: number}|null} */ fit: null,
+    lastFitKey: '',
     /** Thumbnail bucket the tiles on screen were rendered with. */
     renderedBucket: 0,
     rendering: false,
@@ -139,7 +179,10 @@ const view = {
 
 let initialized = false;
 let foldersCache = { time: 0, list: /** @type {string[]|null} */ (null) };
+/** @type {Promise<string[]>|null} */
+let foldersInFlight = null;
 const sanitizedCache = new Map();
+let lastViewportSig = '';
 
 // ------------------------------------------------------------------------------- data access
 
@@ -182,27 +225,34 @@ async function listFolderFiles(folder, signal) {
 /** @returns {Promise<GalleryItem[]>} */
 async function fetchItems(folder, signal) {
     const [files, safe] = await Promise.all([listFolderFiles(folder, signal), sanitizeFolder(folder)]);
+    const prefix = `user/images/${safe}/`;
+    const encodedPrefix = encodePath(prefix);
     return files.map(file => {
         const name = String(file);
-        const path = `user/images/${safe}/${name}`;
-        return { path, url: encodePath(path), name, nameLower: name.toLowerCase(), video: isVideoName(name, VIDEO_EXTENSIONS) };
+        const path = prefix + name;
+        return { path, url: encodedPrefix + encodeURIComponent(name), name, nameLower: name.toLowerCase(), video: isVideoName(name, VIDEO_EXT_SET) };
     });
 }
 
 async function getAllFolders() {
     const now = Date.now();
     if (foldersCache.list && now - foldersCache.time < FOLDERS_CACHE_TTL) return foldersCache.list;
-    try {
-        const response = await fetch('/api/images/folders', { method: 'POST', headers: getRequestHeaders({ omitContentType: true }) });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const data = await response.json();
-        foldersCache = { time: now, list: Array.isArray(data) ? data : [] };
-    } catch (error) {
-        console.error('[Gallery++] Failed to fetch folders:', error);
-        foldersCache = { time: 0, list: null };
-        return [];
+    if (!foldersInFlight) {
+        foldersInFlight = (async () => {
+            try {
+                const response = await fetch('/api/images/folders', { method: 'POST', headers: getRequestHeaders({ omitContentType: true }) });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const data = await response.json();
+                foldersCache = { time: Date.now(), list: Array.isArray(data) ? data : [] };
+            } catch (error) {
+                console.error('[Gallery++] Failed to fetch folders:', error);
+                foldersCache = { time: 0, list: null };
+                return [];
+            }
+            return foldersCache.list ?? [];
+        })().finally(() => { foldersInFlight = null; });
     }
-    return foldersCache.list ?? [];
+    return foldersInFlight;
 }
 
 // ------------------------------------------------------------------------------- loading + filtering
@@ -221,17 +271,20 @@ function revealPanel() {
 
 /**
  * Loads the current folder in place; the panel stays mounted.
- * @param {{keepPage?: boolean, previousPaths?: Set<string>}} [options]
+ * @param {{keepPage?: boolean, previousPaths?: Set<string>, revalidate?: boolean}} [options]
  */
-async function loadFolder({ keepPage = false, previousPaths = null } = {}) {
+async function loadFolder({ keepPage = false, previousPaths = null, revalidate = true } = {}) {
     if (!view.panel) return;
-    invalidateThumbnailChecks(); // re-verify cached thumbnails against the server whenever a folder is (re)loaded
+    if (revalidate) invalidateThumbnailChecks();
     const token = ++view.token;
     view.loadCtl?.abort();
     const ctl = (view.loadCtl = new AbortController());
     if (getLayout().aspect === 'auto') primeAspect();
     view.panel.classList.add('gpp-busy');
-    if (view.items.length === 0) { view.status = 'loading'; renderPage(); }
+    if (view.items.length === 0) {
+        view.status = 'loading';
+        renderPage({ refit: true });
+    }
 
     try {
         const items = await fetchItems(view.folder, ctl.signal);
@@ -249,11 +302,19 @@ async function loadFolder({ keepPage = false, previousPaths = null } = {}) {
         }
         renderPage();
         if (view.revealed) {
-            void detectAspect();
+            void detectAspect(ctl.signal);
         } else {
-            // First open and the shape of this gallery is not known yet: wait briefly for it so the
-            // window appears once, already at its final size.
-            await Promise.race([detectAspect(), new Promise(resolve => setTimeout(resolve, REVEAL_TIMEOUT_MS))]);
+            // First open and the shape of this gallery is not known yet: wait briefly for fast header
+            // probing so the window appears once, already at its final size.
+            let revealTimer = 0;
+            try {
+                await Promise.race([
+                    detectAspect(ctl.signal),
+                    new Promise(resolve => { revealTimer = setTimeout(resolve, REVEAL_TIMEOUT_MS); }),
+                ]);
+            } finally {
+                clearTimeout(revealTimer);
+            }
             if (token === view.token) revealPanel();
         }
     } catch (error) {
@@ -279,11 +340,13 @@ function currentLayout() {
 
 const aspectCache = new Map(); // `${folder}|${count}` -> detected ratio
 
-/** Thumbnail resolution that matches the tiles actually on screen (a little extra for `cover` cropping). */
+/** Thumbnail resolution that matches the tiles actually on screen. */
 function currentBucket() {
     const tw = view.fit?.tw ?? DEFAULT_TILE_SIDE;
     const th = view.fit?.th ?? DEFAULT_TILE_SIDE;
-    return thumbBucket(tw * 1.2, th * 1.2, window.devicePixelRatio);
+    // Slight margin for object-fit: cover when the user chose a fixed aspect preset.
+    const mult = getLayout().aspect === 'auto' ? 1.05 : 1.15;
+    return thumbBucket(tw * mult, th * mult, window.devicePixelRatio);
 }
 
 function readAspectHints() {
@@ -299,10 +362,23 @@ function saveAspectHint(folder, ratio) {
     } catch { /* storage unavailable: the hint is only an optimisation */ }
 }
 
-/** Starts from the last detected shape of this folder so the window opens at its final size. */
+function deleteAspectHint(folder) {
+    try {
+        const hints = readAspectHints();
+        if (!(folder in hints)) return;
+        delete hints[folder];
+        window.localStorage.setItem(ASPECT_HINTS_KEY, JSON.stringify(hints));
+    } catch { /* ignore */ }
+}
+
+/** Starts from the last detected shape of this folder, or clears stale ratio from a previous folder. */
 function primeAspect() {
     const ratio = Number(readAspectHints()[view.folder]);
-    if (ratio > 0 && Number.isFinite(ratio)) { view.autoRatio = ratio; return true; }
+    if (ratio > 0 && Number.isFinite(ratio)) {
+        view.autoRatio = ratio;
+        return true;
+    }
+    view.autoRatio = null;
     return false;
 }
 
@@ -316,48 +392,74 @@ function useCachedAspect() {
     if (ratio) view.autoRatio = ratio;
 }
 
-async function imageRatio(blob) {
-    try {
-        if (typeof createImageBitmap === 'function') {
-            const bitmap = await createImageBitmap(blob);
-            const ratio = bitmap.width / bitmap.height;
-            bitmap.close?.();
-            return ratio;
+/** Picks up to ASPECT_SAMPLES images, prioritizing Page 1 first so detection aligns with visible tiles. */
+function pickAspectSamples(images) {
+    if (images.length <= ASPECT_SAMPLES) return images;
+    const picked = [];
+    const seen = new Set();
+    const pageImages = pageSlice(view.filtered, view.page, view.pageSize).filter(i => !i.video);
+    for (const item of pageImages) {
+        if (picked.length >= ASPECT_SAMPLES) break;
+        if (!seen.has(item.url)) { seen.add(item.url); picked.push(item); }
+    }
+    if (picked.length < ASPECT_SAMPLES) {
+        const step = Math.max(1, images.length / ASPECT_SAMPLES);
+        for (let i = 0; i < images.length && picked.length < ASPECT_SAMPLES; i++) {
+            const item = images[Math.min(images.length - 1, Math.floor(i * step))];
+            if (!seen.has(item.url)) { seen.add(item.url); picked.push(item); }
         }
-    } catch { /* fall through */ }
-    return new Promise((resolve) => {
-        const url = URL.createObjectURL(blob);
-        const img = new Image();
-        img.onload = () => { URL.revokeObjectURL(url); resolve(img.naturalWidth / img.naturalHeight); };
-        img.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
-        img.src = url;
-    });
+    }
+    return picked;
 }
 
-/** Finds the shape most pictures in the open gallery have (only when the option is 'auto'). */
-async function detectAspect() {
-    if (!view.panel || getLayout().aspect !== 'auto') return;
+/**
+ * Finds the shape most pictures in the open gallery have (only when the option is 'auto').
+ * Uses cached {w, h} metadata first, then lightweight Range header probes (<= 64 KB) so it never
+ * downloads full images or competes with Page 1's thumbnail decode queue.
+ * @param {AbortSignal} [signal]
+ */
+async function detectAspect(signal) {
+    if (!view.panel || getLayout().aspect !== 'auto' || signal?.aborted) return;
     const token = view.token;
     const key = `${view.folder}|${view.items.length}`;
     const cached = aspectCache.get(key);
     if (cached) {
-        if (view.autoRatio !== cached) { view.autoRatio = cached; fitPanel(); }
+        if (view.autoRatio !== cached) { view.autoRatio = cached; fitPanel(true); }
         return;
     }
     const images = view.items.filter(i => !i.video);
     if (images.length === 0) return;
-    const step = Math.max(1, images.length / ASPECT_SAMPLES);
-    const samples = [];
-    for (let i = 0; i < Math.min(ASPECT_SAMPLES, images.length); i++) samples.push(images[Math.floor(i * step)]);
 
-    const bucket = currentBucket();
+    const samples = pickAspectSamples(images);
     const ratios = [];
-    await Promise.all(samples.map(async (item) => {
-        const blob = await getThumbnail(item.url, { video: false, bucket });
-        const ratio = blob ? await imageRatio(blob) : null;
-        if (ratio && Number.isFinite(ratio)) ratios.push(ratio);
-    }));
-    if (token !== view.token || !view.panel) return; // the gallery changed meanwhile
+    const needProbe = [];
+
+    for (const item of samples) {
+        const dims = peekDimensions(item.url);
+        if (dims && dims.w > 0 && dims.h > 0) ratios.push(dims.w / dims.h);
+        else needProbe.push(item);
+    }
+
+    if (needProbe.length > 0) {
+        const probed = await Promise.all(needProbe.map(item => probeImageDimensions(item.url, signal)));
+        if (signal?.aborted || token !== view.token || !view.panel) return;
+        for (const dims of probed) {
+            if (dims && dims.w > 0 && dims.h > 0) ratios.push(dims.w / dims.h);
+        }
+    }
+
+    // Fallback for formats without parsed headers (e.g. AVIF / SVG): inspect a few low-priority thumbnails.
+    if (ratios.length === 0 && !signal?.aborted) {
+        const bucket = currentBucket();
+        const fallback = samples.slice(0, 4);
+        const hits = await Promise.all(fallback.map(item => getThumbnail(item.url, { video: false, bucket, signal, priority: 0 })));
+        if (signal?.aborted || token !== view.token || !view.panel) return;
+        for (const hit of hits) {
+            if (hit && hit.w > 0 && hit.h > 0) ratios.push(hit.w / hit.h);
+        }
+    }
+
+    if (signal?.aborted || token !== view.token || !view.panel) return;
     const value = dominantAspect(ratios);
     const preset = ASPECT_PRESETS.find(p => p.value === value);
     if (!preset) return;
@@ -365,7 +467,7 @@ async function detectAspect() {
     saveAspectHint(view.folder, preset.ratio);
     if (getLayout().aspect === 'auto' && view.autoRatio !== preset.ratio) {
         view.autoRatio = preset.ratio;
-        fitPanel();
+        fitPanel(true);
     }
 }
 
@@ -397,10 +499,7 @@ function disposeTiles() {
     view.renderCtl = null;
     view.observer?.disconnect();
     view.observer = null;
-    for (const tile of view.tiles.values()) {
-        if (tile.objectUrl) URL.revokeObjectURL(tile.objectUrl);
-    }
-    view.tiles.clear();
+    view.tiles.clear(); // objectUrls are lifecycle-managed by the thumbs.js LRU so recent pages stay decoded
 }
 
 function showMessage(iconClass, text, ...actions) {
@@ -409,7 +508,8 @@ function showMessage(iconClass, text, ...actions) {
     grid.classList.add('gpp-grid-empty');
 }
 
-function renderPage() {
+/** @param {{refit?: boolean}} [options] */
+function renderPage({ refit = false } = {}) {
     if (!view.panel) return;
     const { grid, scroller } = view.refs;
     const layout = currentLayout();
@@ -420,14 +520,14 @@ function renderPage() {
     view.rendering = true;
     disposeTiles();
     grid.classList.remove('gpp-grid-empty');
-    updatePager(pages); // the pager height is part of the window chrome, so it must be final before fitting
-    fitPanel();         // synchronous: tiles are created at their final size, never resized afterwards
+    updatePager(pages); // pager chrome must be up-to-date before fitting
+    if (refit || !view.fit || needsRefit(pages)) fitPanel(refit);
 
     if (view.status === 'loading' && view.items.length === 0) {
         showMessage('fa-solid fa-spinner fa-spin', t`Loading…`);
     } else if (view.status === 'error') {
         showMessage('fa-solid fa-triangle-exclamation', t`Could not load this gallery.`,
-            h('div', { class: 'menu_button menu_button_icon interactable', onClick: () => loadFolder() }, icon('fa-solid fa-rotate'), h('span', {}, t`Retry`)));
+            h('div', { class: 'menu_button menu_button_icon interactable', onClick: () => loadFolder({ revalidate: true }) }, icon('fa-solid fa-rotate'), h('span', {}, t`Retry`)));
     } else if (view.items.length === 0) {
         showMessage('fa-regular fa-images', t`This gallery is empty. Drop images here or press “Add Image”.`);
     } else if (view.filtered.length === 0) {
@@ -438,7 +538,10 @@ function renderPage() {
         const bucket = currentBucket();
         view.renderedBucket = bucket;
         const fragment = document.createDocumentFragment();
-        const pending = [];
+        /** @type {Tile[]} */
+        const dbMisses = [];
+        /** @type {Tile[]} */
+        const toRevalidate = [];
 
         for (const item of pageSlice(view.filtered, view.page, layout.pageSize)) {
             const img = h('img', { class: 'gpp-img', alt: '', decoding: 'async', draggable: 'false' });
@@ -449,34 +552,23 @@ function renderPage() {
                 title: item.name,
                 'aria-label': item.name,
             }, img, item.video ? icon('fa-solid fa-circle-play gpp-badge') : null, h('span', { class: 'gpp-name' }, item.name));
-            const tile = { el, img, item, objectUrl: null };
+            const tile = { el, img, item, url: null, blob: null };
             view.tiles.set(el, tile);
             fragment.append(el);
 
-            // Instant paint for thumbnails already in memory.
-            // A hit that hasn't been checked against the server yet is still shown right away, but is also
-            // queued so it gets swapped out if the file changed.
+            // Instant paint for thumbnails already in memory (with reused decoded objectUrl).
             const hit = peekThumbnail(item.url, bucket);
-            if (hit) applyThumbnail(tile, hit);
-            if (!hit || !isThumbnailVerified(item.url, bucket)) pending.push(tile);
+            if (hit) {
+                applyThumbnail(tile, hit.url, hit.blob);
+                if (!hit.verified) toRevalidate.push(tile);
+            } else {
+                dbMisses.push(tile);
+            }
         }
         grid.replaceChildren(fragment);
 
-        if (pending.length > 0) {
-            const start = (tile) => void loadTileThumbnail(tile, bucket, ctl.signal);
-            if (typeof IntersectionObserver === 'function') {
-                view.observer = new IntersectionObserver((entries, observer) => {
-                    for (const entry of entries) {
-                        if (!entry.isIntersecting) continue;
-                        observer.unobserve(entry.target);
-                        const tile = view.tiles.get(/** @type {HTMLElement} */ (entry.target));
-                        if (tile) start(tile);
-                    }
-                }, { root: scroller, rootMargin: '200px' });
-                for (const tile of pending) view.observer.observe(tile.el);
-            } else {
-                pending.forEach(start);
-            }
+        if (dbMisses.length > 0 || toRevalidate.length > 0) {
+            void populatePendingTiles(dbMisses, toRevalidate, bucket, ctl.signal);
         }
     }
 
@@ -484,22 +576,95 @@ function renderPage() {
     view.rendering = false;
 }
 
-/** @param {Tile} tile @param {Blob} blob */
-function applyThumbnail(tile, blob) {
-    if (!view.tiles.has(tile.el) || tile.blob === blob) return;
-    if (tile.objectUrl) URL.revokeObjectURL(tile.objectUrl);
-    tile.objectUrl = URL.createObjectURL(blob);
+/**
+ * Hydrates tiles not in RAM via a single batched IndexedDB read (instant paint), schedules
+ * generation for true cache misses, and runs background stale-while-revalidate checks.
+ * @param {Tile[]} dbMisses
+ * @param {Tile[]} toRevalidate
+ * @param {number} bucket
+ * @param {AbortSignal} signal
+ */
+async function populatePendingTiles(dbMisses, toRevalidate, bucket, signal) {
+    /** @type {Tile[]} */
+    const toGenerate = [];
+
+    if (dbMisses.length > 0) {
+        const dbHits = await prefetchPageFromDB(dbMisses.map(tile => tile.item.url), bucket);
+        if (signal.aborted || !view.panel) return;
+        for (const tile of dbMisses) {
+            if (!view.tiles.has(tile.el)) continue;
+            const hit = dbHits.get(tile.item.url);
+            if (hit) {
+                applyThumbnail(tile, hit.url, hit.blob);
+                if (!hit.verified) toRevalidate.push(tile);
+            } else {
+                toGenerate.push(tile);
+            }
+        }
+    }
+
+    if (signal.aborted || !view.panel) return;
+
+    const scroller = view.refs.scroller;
+    const needsScrollLazy = scroller && scroller.scrollHeight > scroller.clientHeight + 4 && typeof IntersectionObserver === 'function';
+
+    const startGenerate = (tile) => void loadTileThumbnail(tile, bucket, signal);
+    const startRevalidate = (tile) => void revalidateTileThumbnail(tile, bucket, signal);
+
+    if (needsScrollLazy && (toGenerate.length > 0 || toRevalidate.length > 0)) {
+        const genSet = new Set(toGenerate.map(tile => tile.el));
+        view.observer = new IntersectionObserver((entries, observer) => {
+            for (const entry of entries) {
+                if (!entry.isIntersecting) continue;
+                observer.unobserve(entry.target);
+                const el = /** @type {HTMLElement} */ (entry.target);
+                const tile = view.tiles.get(el);
+                if (!tile) continue;
+                if (genSet.has(el)) startGenerate(tile);
+                else startRevalidate(tile);
+            }
+        }, { root: scroller, rootMargin: '200px' });
+        for (const tile of toGenerate) view.observer.observe(tile.el);
+        for (const tile of toRevalidate) view.observer.observe(tile.el);
+    } else {
+        // Desktop pages fit entirely in view: skip the 1-frame IntersectionObserver delay.
+        for (const tile of toGenerate) startGenerate(tile);
+        for (const tile of toRevalidate) startRevalidate(tile);
+    }
+}
+
+/** @param {Tile} tile @param {string} url @param {Blob} blob */
+function applyThumbnail(tile, url, blob) {
+    if (!view.tiles.has(tile.el) || (tile.blob === blob && tile.url === url)) return;
+    tile.url = url;
     tile.blob = blob;
-    tile.img.src = tile.objectUrl;
-    tile.el.classList.add('gpp-loaded');
+    tile.el.classList.remove('gpp-failed');
+    tile.img.src = url;
+    if (tile.img.complete && tile.img.naturalWidth > 0) {
+        tile.el.classList.add('gpp-loaded');
+    } else if (typeof tile.img.decode === 'function') {
+        tile.img.decode().then(
+            () => { if (view.tiles.has(tile.el) && tile.url === url) tile.el.classList.add('gpp-loaded'); },
+            () => { if (view.tiles.has(tile.el) && tile.url === url) tile.el.classList.add('gpp-loaded'); },
+        );
+    } else {
+        tile.el.classList.add('gpp-loaded');
+    }
 }
 
 /** @param {Tile} tile */
 async function loadTileThumbnail(tile, bucket, signal) {
-    const blob = await getThumbnail(tile.item.url, { video: tile.item.video, bucket, signal });
+    const hit = await getThumbnail(tile.item.url, { video: tile.item.video, bucket, signal, priority: 1, skipCache: true });
     if (signal.aborted || !view.tiles.has(tile.el)) return;
-    if (blob) applyThumbnail(tile, blob);
+    if (hit) applyThumbnail(tile, hit.url, hit.blob);
     else tile.el.classList.add('gpp-failed');
+}
+
+/** @param {Tile} tile */
+async function revalidateTileThumbnail(tile, bucket, signal) {
+    const fresh = await revalidateThumbnail(tile.item.url, { video: tile.item.video, bucket, signal });
+    if (signal.aborted || !view.tiles.has(tile.el)) return;
+    if (fresh) applyThumbnail(tile, fresh.url, fresh.blob);
 }
 
 function updatePager(pages) {
@@ -537,31 +702,33 @@ function goToPage(page) {
 
 function setQuery(value) {
     if (!view.panel) return;
-    view.query = String(value ?? '');
+    const next = String(value ?? '');
+    const tokensKey = tokenizeQuery(next).join('\0');
     const { search, clearSearch } = view.refs;
-    if (search.value !== view.query) search.value = view.query;
-    clearSearch.hidden = view.query === '';
+    view.query = next;
+    if (search.value !== next) search.value = next;
+    clearSearch.hidden = next === '';
+    if (tokensKey === view.queryTokensKey) return;
+    view.queryTokensKey = tokensKey;
     applyFilter();
     view.page = 1;
     renderPage();
 }
 
-/** Re-applies layout options (rows/cols/size) to the open window, keeping the user's place. */
+/** Re-applies layout options (rows/cols/aspect) to the open window, keeping the user's place. */
 function applyLayoutToOpenGallery({ resizePanel = true } = {}) {
     if (!view.panel) return;
+    const layout = currentLayout();
     const firstVisible = (view.page - 1) * view.pageSize;
-    view.page = pageForIndex(firstVisible, currentLayout().pageSize);
-    applyLayoutVariables();
-    if (resizePanel) {
-        if (!isMobileLayout()) {
-            // A stale saved size would otherwise win again the next time the window is opened.
-            const saved = power_user?.movingUIState?.[PANEL_ID];
-            if (saved) { delete saved.width; delete saved.height; SillyTavern.getContext().saveSettingsDebounced(); }
-        }
-        fitPanel();
+    view.page = pageForIndex(firstVisible, layout.pageSize);
+    view.lastFitKey = '';
+    if (resizePanel && !isMobileLayout()) {
+        // A stale saved size would otherwise win again the next time the window is opened.
+        const saved = power_user?.movingUIState?.[PANEL_ID];
+        if (saved) { delete saved.width; delete saved.height; SillyTavern.getContext().saveSettingsDebounced(); }
     }
-    void detectAspect();
-    renderPage();
+    renderPage({ refit: resizePanel });
+    if (layout.aspect === 'auto') void detectAspect(view.loadCtl?.signal);
 }
 
 // ------------------------------------------------------------------------------- window placement
@@ -625,16 +792,41 @@ function measureChrome(panel, padY, gap) {
     return chrome + gap * Math.max(0, count - 1);
 }
 
+function computeFitKey(pages) {
+    const mobile = isMobileLayout();
+    const { cols, rows } = getLayout();
+    const ratio = activeRatio();
+    const pageDigits = String(pages ?? pageCount(view.filtered.length, view.pageSize)).length;
+    if (mobile) {
+        return `m|${window.innerWidth}x${window.innerHeight}|${cols}x${rows}|${ratio}|${pageDigits}`;
+    }
+    const side = view.panel?.dataset.gppSide === 'left' || view.panel?.dataset.gppSide === 'right'
+        ? view.panel.dataset.gppSide
+        : getSide();
+    const b = getBounds(side, true);
+    return `d|${side}|${b.left},${b.top},${b.width},${b.height}|${cols}x${rows}|${ratio}|${pageDigits}`;
+}
+
+function needsRefit(pages) {
+    if (!view.panel || !view.fit) return true;
+    return computeFitKey(pages) !== view.lastFitKey;
+}
+
 /**
  * Sizes the gallery window and its thumbnails to the free strip beside the chat panel.
  * The window sits flush against the chat panel and the bottom of the screen (like opened pictures)
- * and hugs its grid; the tiles are as large as the strip allows for the chosen columns x rows,
- * so a few big pictures and many small ones both fill the window neatly.
+ * and hugs its grid; the tiles are as large as the strip allows for the chosen columns x rows.
  */
-function fitPanel() {
+function fitPanel(force = false) {
     const panel = view.panel;
     if (!panel || !panel.isConnected) return;
+    const fitKey = computeFitKey();
+    if (!force && fitKey === view.lastFitKey && view.fit) return;
+    view.lastFitKey = fitKey;
+
     if (isMobileLayout()) { fitPanelMobile(panel); return; }
+
+    panel.dataset.gppMode = 'desktop';
     const side = panel.dataset.gppSide === 'left' || panel.dataset.gppSide === 'right' ? panel.dataset.gppSide : getSide();
     panel.dataset.gppSide = side;
     const bounds = getBounds(side, true);
@@ -655,7 +847,8 @@ function fitPanel() {
     panel.style.maxWidth = `${bounds.width}px`;
 
     // The toolbar wraps differently at different widths, which changes the height left for the grid
-    // and with it the tile size and the width again. Iterate until that settles (usually 2 passes).
+    // and with it the tile size and the width again. Iterate until settled, always keeping `tile`
+    // in sync with the final `width`.
     let width = bounds.width;
     let tile = { tw: 24, th: 24 };
     for (let pass = 0; pass < 5; pass++) {
@@ -666,6 +859,11 @@ function fitPanel() {
         const next = Math.min(bounds.width, Math.max(minWidth, wanted));
         if (Math.abs(next - width) < 1) break;
         width = next;
+        if (pass === 4) {
+            panel.style.width = `${width}px`;
+            const finalChrome = measureChrome(panel, padY, gap);
+            tile = fitTile(width - padX - gridX - 1, bounds.height - finalChrome - gridY, cols, rows, ratio);
+        }
     }
     panel.style.width = `${width}px`;
     view.fit = tile;
@@ -683,8 +881,13 @@ function fitPanel() {
     }
 }
 
-/** Full-screen layout: tiles fill the width, and the whole page is fitted into the height when it can. */
+/** Full-screen layout: clears any desktop inline geometry and fits tiles into the viewport. */
 function fitPanelMobile(panel) {
+    if (panel.dataset.gppMode !== 'mobile') {
+        panel.dataset.gppMode = 'mobile';
+        clearDesktopInlineGeometry(panel);
+        applySavedWindowState(panel);
+    }
     const { cols, rows } = getLayout();
     const ratio = activeRatio();
     const scroller = view.refs.scroller;
@@ -703,7 +906,15 @@ function fitPanelMobile(panel) {
 
 /** @param {HTMLElement} win @param {'left'|'right'} side */
 function fitImageWindow(win, side) {
-    if (isMobileLayout()) return;
+    if (isMobileLayout()) {
+        if (win.dataset.gppMode !== 'mobile') {
+            win.dataset.gppMode = 'mobile';
+            clearDesktopInlineGeometry(win);
+            applySavedWindowState(win);
+        }
+        return;
+    }
+    win.dataset.gppMode = 'desktop';
     win.dataset.gppSide = side;
     const w = Number(win.dataset.gppW);
     const hgt = Number(win.dataset.gppH);
@@ -726,14 +937,23 @@ function fitImageWindow(win, side) {
 }
 
 function fitAllWindows() {
-    fitPanel();
-    if (isMobileLayout()) return;
-    document.querySelectorAll('.galleryImageDraggable').forEach((win) => {
+    const imageWins = document.querySelectorAll('.galleryImageDraggable');
+    if (!view.panel && imageWins.length === 0) return;
+
+    // Ignore vertical-only #sheld mutations (e.g. chat growing while streaming).
+    const sheld = document.getElementById('sheld');
+    const r = sheld ? sheld.getBoundingClientRect() : null;
+    const sig = `${window.innerWidth}x${window.innerHeight}|${r ? `${Math.round(r.left)},${Math.round(r.right)}` : ''}`;
+    if (sig === lastViewportSig) return;
+    lastViewportSig = sig;
+
+    fitPanel(true);
+    imageWins.forEach((win) => {
         if (win instanceof HTMLElement) fitImageWindow(win, win.dataset.gppSide === 'left' ? 'left' : 'right');
     });
 }
 
-/** After the user drags a window across the chat panel, remember which side it now belongs to. */
+/** After the user drags a gallery/image window across the chat panel, remember which side it now belongs to. */
 function rememberDraggedSides() {
     const sheld = document.getElementById('sheld')?.getBoundingClientRect();
     if (!sheld) return;
@@ -769,6 +989,9 @@ function buildPanel() {
     panel.querySelector('.dragTitle').classList.add('flex-container', 'alignItemsBaseline');
     panel.querySelector('.dragTitle').append(h('span', {}, t`Image Gallery`), h('small', { class: 'gpp-title-tag' }, '++'));
 
+    view.panelCtl?.abort();
+    view.panelCtl = new AbortController();
+
     const refs = {};
 
     // --- folder row
@@ -800,11 +1023,12 @@ function buildPanel() {
     refs.scroller = h('div', { class: 'gpp-scroller' }, refs.grid);
 
     // --- pager
-    const pagerButton = (classes, label) => h('div', { class: `menu_button menu_button_icon interactable gallery-page-button`, title: label, 'aria-label': label, role: 'button' }, icon(classes));
+    const pagerButton = (classes, label) => h('div', { class: 'menu_button menu_button_icon interactable gallery-page-button', title: label, 'aria-label': label, role: 'button' }, icon(classes));
     refs.first = pagerButton('fa-solid fa-angles-left fa-fw', t`First page`);
     refs.prev = pagerButton('fa-solid fa-chevron-left fa-fw', t`Previous gallery page`);
     refs.next = pagerButton('fa-solid fa-chevron-right fa-fw', t`Next gallery page`);
-    refs.last = pagerButton('fa-solid fa-angles-right fa-fw', t`Last page`);
+    refs.last = pagerButton('fa-solid fa-chevron-right fa-fw', t`Last page`);
+    refs.last.replaceChildren(icon('fa-solid fa-angles-right fa-fw'));
     refs.pageInput = h('input', {
         type: 'text', inputmode: 'numeric', class: 'text_pole gpp-page-input', value: '1',
         title: t`Type a page number and press Enter to jump to it`, autocomplete: 'off',
@@ -818,7 +1042,7 @@ function buildPanel() {
 
     panel.append(folderRow, toolRow, refs.scroller, pager, refs.fileInput);
     view.refs = refs;
-    wirePanel(panel);
+    wirePanel(panel, view.panelCtl.signal);
     return panel;
 }
 
@@ -844,18 +1068,30 @@ function updateFolderControls() {
 
 /**
  * Folder-name suggestions: a small self-made dropdown (no jQuery UI, no <datalist>), so picking
- * an entry always assigns that folder.
+ * an entry always assigns that folder. All global listeners bind to `panelSignal` so closing the
+ * gallery leaves zero leaked handlers or detached DOM trees.
  */
-function wireFolderSuggestions(input, submit) {
+function wireFolderSuggestions(input, submit, panelSignal) {
     const list = h('div', { class: 'gpp-suggest', role: 'listbox', hidden: true });
     document.body.append(list);
     view.refs.suggest = list;
     let entries = [];
     let active = -1;
+    /** @type {Element|null} */
+    let activeEl = null;
     let seq = 0;
 
     const isOpen = () => !list.hidden;
-    const close = () => { seq++; list.hidden = true; active = -1; document.removeEventListener('pointerdown', onOutside, true); };
+    const close = () => {
+        seq++;
+        list.hidden = true;
+        active = -1;
+        activeEl?.classList.remove('gpp-active');
+        activeEl = null;
+        document.removeEventListener('pointerdown', onOutside, true);
+    };
+    view.refs.closeSuggest = close;
+
     const onOutside = (e) => { if (e.target !== input && !list.contains(e.target)) close(); };
     const position = () => {
         const r = input.getBoundingClientRect();
@@ -864,10 +1100,13 @@ function wireFolderSuggestions(input, submit) {
         list.style.width = `${Math.round(r.width)}px`;
         list.style.maxHeight = `${Math.max(120, Math.min(260, window.innerHeight - r.bottom - 12))}px`;
     };
-    const setActive = (index) => {
+    const setActive = (index, scroll = false) => {
+        if (active === index) return;
+        activeEl?.classList.remove('gpp-active');
         active = index;
-        [...list.children].forEach((el, i) => el.classList.toggle('gpp-active', i === index));
-        list.children[index]?.scrollIntoView({ block: 'nearest' });
+        activeEl = index >= 0 ? (list.children[index] ?? null) : null;
+        activeEl?.classList.add('gpp-active');
+        if (scroll) activeEl?.scrollIntoView({ block: 'nearest' });
     };
     const choose = (name) => {
         input.value = name;
@@ -875,25 +1114,29 @@ function wireFolderSuggestions(input, submit) {
         submit();
     };
     const render = () => {
+        active = -1;
+        activeEl = null;
         list.replaceChildren(...entries.map((name, i) => {
             const item = h('div', { class: `gpp-suggest-item${name === view.folder ? ' gpp-current' : ''}`, role: 'option', title: name }, name);
             item.addEventListener('mousedown', (e) => e.preventDefault()); // keep the input focused
             item.addEventListener('click', () => choose(name));
-            item.addEventListener('mousemove', () => { if (active !== i) setActive(i); });
+            item.addEventListener('mousemove', () => setActive(i, false));
             return item;
         }));
         if (!entries.length) { close(); return; }
         position();
-        if (!isOpen()) { list.hidden = false; document.addEventListener('pointerdown', onOutside, true); }
+        if (!isOpen()) {
+            list.hidden = false;
+            document.addEventListener('pointerdown', onOutside, { capture: true, signal: panelSignal });
+        }
     };
     const open = async (filter) => {
-        if (input.readOnly) return;
+        if (input.readOnly || panelSignal.aborted) return;
         const mine = ++seq;
         const all = await getAllFolders();
-        if (mine !== seq) return;
+        if (mine !== seq || panelSignal.aborted || document.activeElement !== input) return;
         const term = String(filter ?? '').trim().toLowerCase();
         entries = all.filter(f => !term || f.toLowerCase().includes(term));
-        active = -1;
         render();
     };
 
@@ -907,7 +1150,7 @@ function wireFolderSuggestions(input, submit) {
             if (!isOpen()) { void open(''); e.preventDefault(); return; }
             e.preventDefault();
             const n = entries.length;
-            if (n) setActive(e.key === 'ArrowDown' ? (active + 1) % n : (active - 1 + n) % n);
+            if (n) setActive(e.key === 'ArrowDown' ? (active + 1) % n : (active - 1 + n) % n, true);
         } else if (e.key === 'Enter') {
             e.preventDefault();
             if (isOpen() && active >= 0 && entries[active] !== undefined) choose(entries[active]);
@@ -917,11 +1160,12 @@ function wireFolderSuggestions(input, submit) {
             close();
         }
     });
-    window.addEventListener('resize', close);
+    window.addEventListener('resize', close, { signal: panelSignal });
+    panelSignal.addEventListener('abort', close, { once: true });
     list.addEventListener('wheel', (e) => e.stopPropagation(), { passive: true });
 }
 
-function wirePanel(panel) {
+function wirePanel(panel, panelSignal) {
     const r = view.refs;
 
     // Pager
@@ -941,6 +1185,7 @@ function wirePanel(panel) {
 
     // Search
     const runSearch = debounce(() => setQuery(r.search.value), SEARCH_DEBOUNCE_MS);
+    panelSignal.addEventListener('abort', () => runSearch.cancel(), { once: true });
     r.search.addEventListener('input', () => { r.clearSearch.hidden = r.search.value === ''; runSearch(); });
     r.search.addEventListener('keydown', (e) => {
         e.stopPropagation();
@@ -950,13 +1195,13 @@ function wirePanel(panel) {
     r.clearSearch.addEventListener('click', () => { runSearch.cancel(); setQuery(''); r.search.focus(); });
 
     // Sort / side / upload
-    r.sort.addEventListener('change', () => { setSort(r.sort.value); void loadFolder(); });
+    r.sort.addEventListener('change', () => { setSort(r.sort.value); void loadFolder({ revalidate: false }); });
     updateSideToggle();
     r.sideToggle.addEventListener('click', () => {
         setSide(getSide() === 'right' ? 'left' : 'right');
         updateSideToggle();
         panel.dataset.gppSide = getSide();
-        fitPanel();
+        fitPanel(true);
     });
     r.addButton.addEventListener('click', () => r.fileInput.click());
     r.fileInput.addEventListener('change', async () => {
@@ -971,7 +1216,7 @@ function wirePanel(panel) {
     r.folderRestore.addEventListener('click', () => void restoreDefaultFolder());
     r.refreshButton.addEventListener('click', () => void refreshGallery());
     r.deleteToggle.addEventListener('click', () => setDeleteMode(!view.deleteMode));
-    wireFolderSuggestions(r.folderInput, submitFolder);
+    wireFolderSuggestions(r.folderInput, submitFolder, panelSignal);
 
     // Grid: left-click → left window, right-click → right window, Enter/Space like left-click.
     r.grid.addEventListener('click', (e) => onTileActivate(e, 'left'));
@@ -1046,7 +1291,7 @@ async function deleteItem(item) {
 
 async function uploadFiles(files) {
     if (view.uploading || !view.panel) return;
-    const accepted = files.filter(f => /^(image|video)\//.test(f.type) || isVideoName(f.name, VIDEO_EXTENSIONS) || /\.(png|jpe?g|gif|webp|bmp|avif|svg)$/i.test(f.name));
+    const accepted = files.filter(f => /^(image|video)\//.test(f.type) || isVideoName(f.name, VIDEO_EXT_SET) || /\.(png|jpe?g|gif|webp|bmp|avif|svg)$/i.test(f.name));
     if (accepted.length === 0) { toastr.warning(t`Only image and video files can be uploaded.`); return; }
 
     view.uploading = true;
@@ -1068,15 +1313,23 @@ async function uploadFiles(files) {
         }
     } finally {
         view.uploading = false;
+        if (!ok || !view.panel || view.folder !== folder) {
+            view.panel?.classList.remove('gpp-busy');
+        }
     }
-    if (ok) toastr.success(`${t`Uploaded`} ${ok} ${ok === 1 ? t`file` : t`files`}.`);
+    if (ok) {
+        foldersCache = { time: 0, list: null };
+        toastr.success(`${t`Uploaded`} ${ok} ${ok === 1 ? t`file` : t`files`}.`);
+    }
     if (failed) toastr.error(`${t`Failed to upload`} ${failed} ${failed === 1 ? t`file` : t`files`}.`);
-    if (view.panel && view.folder === folder) await loadFolder({ previousPaths: before });
+    if (ok && view.panel && view.folder === folder) {
+        await loadFolder({ previousPaths: before, revalidate: false });
+    }
 }
 
 let refreshing = false;
 
-/** Re-lists the folder and throws away every cached thumbnail of it, so all of them are rebuilt from the files. */
+/** Re-lists the folder and throws away every cached thumbnail under it so all of them rebuild from disk. */
 async function refreshGallery() {
     if (!view.panel || refreshing) return;
     refreshing = true;
@@ -1085,12 +1338,15 @@ async function refreshGallery() {
     const folder = view.folder;
     try {
         view.renderCtl?.abort(); // stop thumbnail work for the old tiles
-        await purgeThumbnails(view.items.map(i => i.url));
+        const safe = await sanitizeFolder(folder);
+        await purgeFolderThumbnails(`${encodePath(`user/images/${safe}`)}/`);
         for (const key of [...aspectCache.keys()]) {
             if (key.startsWith(`${folder}|`)) aspectCache.delete(key);
         }
+        deleteAspectHint(folder);
         foldersCache = { time: 0, list: null };
-        await loadFolder({ keepPage: true });
+        if (!view.panel || view.folder !== folder) return; // character/folder changed during purge
+        await loadFolder({ keepPage: true, revalidate: true });
         if (view.panel && view.folder === folder && view.status === 'ready') toastr.success(t`Gallery refreshed`);
     } finally {
         refreshing = false;
@@ -1099,6 +1355,18 @@ async function refreshGallery() {
 }
 
 let folderBusy = false;
+
+function resetViewForFolderSwitch(nextFolder) {
+    view.folder = nextFolder;
+    view.items = [];
+    view.filtered = [];
+    view.status = 'loading';
+    view.query = '';
+    view.queryTokensKey = '';
+    if (view.refs.search) view.refs.search.value = '';
+    if (view.refs.clearSearch) view.refs.clearSearch.hidden = true;
+    updateFolderControls();
+}
 
 async function applyFolderChoice(requested) {
     if (!view.panel || folderBusy) return;
@@ -1128,9 +1396,8 @@ async function applyFolderChoice(requested) {
             toastr.info(t`This gallery is already showing the folder ${nextFolder}`);
             return;
         }
-        view.folder = nextFolder;
-        updateFolderControls();
-        await loadFolder();
+        resetViewForFolderSwitch(nextFolder);
+        await loadFolder({ revalidate: true });
         toastr.info(t`Gallery folder changed to ${nextFolder}`);
     } catch (error) {
         console.error('[Gallery++] Failed to change gallery folder:', error);
@@ -1141,13 +1408,18 @@ async function applyFolderChoice(requested) {
 }
 
 async function restoreDefaultFolder() {
+    if (!view.panel || folderBusy) return;
     const target = getTarget();
-    if (!target || target.kind !== 'char' || !view.panel) return;
+    if (!target || target.kind !== 'char') return;
     if (!getFolderOverride(target.character.avatar)) { toastr.info(t`This character already uses its default folder.`); return; }
-    setFolderOverride(target.character.avatar, null);
-    view.folder = target.character.name;
-    updateFolderControls();
-    await loadFolder();
+    folderBusy = true;
+    try {
+        setFolderOverride(target.character.avatar, null);
+        resetViewForFolderSwitch(target.character.name);
+        await loadFolder({ revalidate: true });
+    } finally {
+        folderBusy = false;
+    }
 }
 
 // ------------------------------------------------------------------------------- open / close
@@ -1158,18 +1430,21 @@ async function openGallery() {
 
     if (view.panel?.isConnected) {
         // Already open: follow the current chat, or just refresh the listing.
-        if (!(await syncToContext())) await loadFolder({ keepPage: true });
+        if (!(await syncToContext())) await loadFolder({ keepPage: true, revalidate: true });
         return;
     }
     // A previous window may still be fading out; two elements with one id would break dragging.
     document.getElementById(PANEL_ID)?.remove();
     view.panel = null;
     view.fit = null;
+    view.lastFitKey = '';
+    view.autoRatio = null;
     view.kind = target.kind;
     view.folder = target.folder;
     view.items = [];
     view.filtered = [];
     view.query = '';
+    view.queryTokensKey = '';
     view.page = 1;
     view.status = 'loading';
     view.deleteMode = false;
@@ -1190,16 +1465,24 @@ async function openGallery() {
     applyLayoutVariables();
 
     document.getElementById('movingDivs').append(panel);
-    view.fit = null;
-    if (isMobileLayout()) applySavedWindowState(panel);
-    else panel.dataset.gppSide = getSide();
+    raiseGalleryWindow(panel);
+    if (isMobileLayout()) {
+        panel.dataset.gppMode = 'mobile';
+        applySavedWindowState(panel);
+    } else {
+        panel.dataset.gppMode = 'desktop';
+        panel.dataset.gppSide = getSide();
+    }
     dragElement($(panel));
-    renderPage(); // fits the (still invisible) window to its final size
-    // Show it right away when its final shape is certain; otherwise loadFolder() reveals it as soon as
-    // the shape is detected. The timer is only a safety net for a slow or failing server.
-    if (shapeKnown) revealPanel();
-    else setTimeout(() => { if (view.panel === panel) revealPanel(); }, REVEAL_TIMEOUT_MS + 600);
-    await loadFolder();
+
+    // loadFolder() synchronously renders the initial loading state and fits the window once.
+    const loadPromise = loadFolder({ revalidate: true });
+    if (shapeKnown) {
+        revealPanel();
+    } else {
+        setTimeout(() => { if (view.panel === panel) revealPanel(); }, REVEAL_TIMEOUT_MS + 600);
+    }
+    await loadPromise;
 }
 
 function closeGallery() {
@@ -1207,11 +1490,14 @@ function closeGallery() {
     if (!panel) return;
     view.token++;
     view.loadCtl?.abort();
+    view.panelCtl?.abort();
+    view.panelCtl = null;
     disposeTiles();
     view.refs.suggest?.remove();
     view.panel = null;
     view.refs = {};
     view.fit = null;
+    view.lastFitKey = '';
     view.renderedBucket = 0;
     view.items = [];
     view.filtered = [];
@@ -1233,15 +1519,8 @@ async function syncToContext() {
     if (!target) { closeGallery(); return true; }
     if (target.kind === view.kind && target.folder === view.folder) return false;
     view.kind = target.kind;
-    view.folder = target.folder;
-    view.items = [];
-    view.filtered = [];
-    view.status = 'loading';
-    view.query = '';
-    view.refs.search.value = '';
-    view.refs.clearSearch.hidden = true;
-    updateFolderControls();
-    await loadFolder();
+    resetViewForFolderSwitch(target.folder);
+    await loadFolder({ revalidate: true });
     return true;
 }
 
@@ -1253,6 +1532,7 @@ function openMedia(item, side) {
     if (existing instanceof HTMLElement) {
         // Same picture already open: move it to the requested side instead of stacking duplicates.
         fitImageWindow(existing, side);
+        raiseGalleryWindow(existing);
         existing.classList.add('gpp-flash');
         setTimeout(() => existing.classList.remove('gpp-flash'), 600);
         return;
@@ -1287,12 +1567,18 @@ function openMedia(item, side) {
     if (media instanceof HTMLVideoElement) { media.controls = true; media.autoplay = true; media.loop = true; }
     win.append(media);
     document.getElementById('movingDivs').append(win);
+    raiseGalleryWindow(win);
 
-    if (isMobileLayout()) applySavedWindowState(win);
+    if (isMobileLayout()) {
+        win.dataset.gppMode = 'mobile';
+        applySavedWindowState(win);
+    }
     win.dataset.gppSide = side;
 
     let shown = false;
+    let fallbackTimer = 0;
     const reveal = () => {
+        clearTimeout(fallbackTimer);
         if (shown || !win.isConnected) return;
         shown = true;
         win.style.visibility = '';
@@ -1301,7 +1587,7 @@ function openMedia(item, side) {
     const fit = () => {
         const w = media instanceof HTMLVideoElement ? media.videoWidth : media.naturalWidth;
         const hgt = media instanceof HTMLVideoElement ? media.videoHeight : media.naturalHeight;
-        if (!w || !hgt) return;
+        if (!w || !hgt) { reveal(); return; }
         win.dataset.gppW = String(w);
         win.dataset.gppH = String(hgt);
         fitImageWindow(win, win.dataset.gppSide === 'left' ? 'left' : 'right');
@@ -1309,11 +1595,11 @@ function openMedia(item, side) {
     };
     media.addEventListener(media instanceof HTMLVideoElement ? 'loadedmetadata' : 'load', fit, { once: true });
     media.addEventListener('error', reveal, { once: true }); // broken file: show the (default-sized) window anyway
-    setTimeout(reveal, 3000); // safety net for a very slow server
+    fallbackTimer = setTimeout(reveal, 3000); // safety net for a very slow server
 
     dragElement($(win));
     fitImageWindow(win, side); // provisional placement while hidden
-    if (media instanceof HTMLImageElement && media.complete) fit(); // cached picture: size is known right now
+    if (media instanceof HTMLImageElement && media.complete) fit(); // cached (or cached-broken) picture
 }
 
 /** Closes a window through its close button on purpose (bypasses the Escape guard below). */
@@ -1332,7 +1618,7 @@ function closeAllImages() {
 // That click is not a real mouse click, so Gallery++ can tell it apart and refuse it when it should not
 // close anything:
 //   - the "Escape does not close pictures / gallery" option is on, or
-//   - Escape was used for something else: cancelling a message edit, or leaving a text field.
+//   - Escape was used for something else: cancelling a message edit, closing a popup, or leaving a text field.
 // SillyTavern removes the edit box while handling the same key press, so the state is captured *before*
 // SillyTavern sees the event (capture phase on window).
 
@@ -1342,11 +1628,17 @@ let allowSyntheticClose = false;
 
 function escapeIsForSomethingElse() {
     if (document.querySelector('#curEditTextarea')) return true; // editing a chat message
+    if (Popup.util.isPopupOpen()) return true; // dismissing a confirmation / modal dialog
     return isTyping();
 }
 
 function onEscapeCapture(event) {
     if (event.key !== 'Escape') return;
+    if (event.repeat) {
+        // Keep the initial protection active while Escape is held down.
+        lastEscape.time = performance.now();
+        return;
+    }
     lastEscape = {
         time: performance.now(),
         protect: getBoolean('escKeepsOpen') || escapeIsForSomethingElse(),
@@ -1375,8 +1667,10 @@ function isTyping() {
 }
 
 function onHotkey(event) {
-    if (!getBoolean('hotkeys')) return;
+    // Check the key first so normal typing across SillyTavern does zero settings lookups.
+    if (!HOTKEY_SET.has(event.key)) return;
     if (event.isComposing || event.defaultPrevented || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return;
+    if (!getBoolean('hotkeys')) return;
     if (isTyping() || Popup.util.isPopupOpen()) return;
 
     switch (event.key) {
@@ -1464,6 +1758,7 @@ function mountSettings() {
     });
     const clearButton = h('div', { class: 'menu_button menu_button_icon interactable', role: 'button', title: t`Thumbnails are regenerated the next time you open a folder` }, icon('fa-solid fa-broom'), h('span', {}, t`Clear thumbnail cache`));
     clearButton.addEventListener('click', async () => {
+        view.renderCtl?.abort();
         const removed = await clearThumbnailCache();
         toastr.success(`${t`Thumbnail cache cleared`} (${removed})`);
         if (view.panel) renderPage();
@@ -1552,19 +1847,33 @@ function addMenuEntries() {
     }
 }
 
-// ------------------------------------------------------------------------------- bootstrap
+// ------------------------------------------------------------------------------- bootstrap & cleanup
+
+async function detectUserScope() {
+    try {
+        const mod = await import('../../../user.js');
+        if (typeof mod?.currentUser?.handle === 'string' && mod.currentUser.handle) {
+            return mod.currentUser.handle;
+        }
+    } catch { /* single-user or custom host */ }
+    return null;
+}
 
 export async function init() {
     if (initialized) return;
     initialized = true;
 
+    const userScope = await detectUserScope();
     configureSettings({
         getRoot: () => SillyTavern.getContext().extensionSettings,
         saveDebounced: () => SillyTavern.getContext().saveSettingsDebounced(),
         saveNow: typeof ST.saveSettings === 'function' ? () => ST.saveSettings() : undefined,
         storage: (() => { try { return window.localStorage; } catch { return null; } })(),
+        userScope,
     });
     getSettings(); // validates, migrates from the original Gallery, and restores folder assignments
+
+    const movingDivs = document.getElementById('movingDivs');
 
     // Closing windows. ST has no global handler for generic draggables.
     $('#movingDivs').on('click', '.gpp-panel .dragClose, .galleryImageDraggable .dragClose', function (event) {
@@ -1579,6 +1888,27 @@ export async function init() {
         else fadeRemove(target);
     });
 
+    // Track drags and active focus strictly on gallery / opened picture windows (never on unrelated ST clicks).
+    let draggingGalleryWindow = false;
+    const onMovingPointerDown = (event) => {
+        const target = event.target instanceof Element ? event.target : null;
+        if (!target) return;
+        const win = target.closest('#gallery, .galleryImageDraggable');
+        if (win instanceof HTMLElement) raiseGalleryWindow(win);
+        if (target.closest('#gallery .drag-grabber, .galleryImageDraggable .drag-grabber')) {
+            draggingGalleryWindow = true;
+            view.refs.closeSuggest?.();
+        }
+    };
+    const onDragEnd = () => {
+        if (!draggingGalleryWindow) return;
+        draggingGalleryWindow = false;
+        setTimeout(rememberDraggedSides, 0);
+    };
+    movingDivs?.addEventListener('pointerdown', onMovingPointerDown, { passive: true });
+    document.addEventListener('pointerup', onDragEnd, { passive: true });
+    document.addEventListener('pointercancel', onDragEnd, { passive: true });
+
     document.addEventListener('keydown', onHotkey);
     window.addEventListener('keydown', onEscapeCapture, true);
     applyPictureStyle();
@@ -1588,9 +1918,7 @@ export async function init() {
     window.addEventListener('resize', refit);
     const sheld = document.getElementById('sheld');
     if (sheld && typeof ResizeObserver === 'function') new ResizeObserver(refit).observe(sheld);
-    const afterDrag = () => setTimeout(rememberDraggedSides, 0);
-    document.addEventListener('mouseup', afterDrag);
-    document.addEventListener('touchend', afterDrag);
+
     eventSource.on(event_types.CHAT_CHANGED, () => void syncToContext());
     eventSource.on(event_types.CHARACTER_RENAMED, (oldAvatar, newAvatar) => renameAvatar(oldAvatar, newAvatar));
     eventSource.on(event_types.CHARACTER_DELETED, (data) => removeAvatar(data?.character?.avatar));
@@ -1599,4 +1927,13 @@ export async function init() {
     registerCommands();
     addMenuEntries();
     mountSettings();
+}
+
+/** SillyTavern 1.17+ lifecycle hook: removes cached browser data when the extension is cleaned/uninstalled. */
+export async function clean() {
+    closeGallery();
+    closeAllImages();
+    clearLocalBackup();
+    try { window.localStorage.removeItem(ASPECT_HINTS_KEY); } catch { /* ignore */ }
+    await deleteThumbnailDatabase();
 }

@@ -1,4 +1,4 @@
-/* Gallery++ 2.0 — SPDX-License-Identifier: AGPL-3.0-or-later */
+/* Gallery++ 2.1 — SPDX-License-Identifier: AGPL-3.0-or-later */
 
 /* ---------------------------------------------------------------- window */
 #gallery.gpp-panel {
@@ -11,6 +11,7 @@
     box-sizing: border-box;
     overflow: hidden;
     resize: both;
+    contain: layout style;
 }
 
 #gallery.gpp-panel.gpp-dropping {
@@ -45,12 +46,18 @@
     }
 }
 
-/* Keep the gallery and its pictures behind other SillyTavern UI on desktop. On narrow
-   screens SillyTavern makes draggables full-screen, so they must stay on top there. */
+/* Keep the gallery and its pictures behind other SillyTavern UI on desktop, while still allowing
+   the most recently clicked gallery/picture window to stack above its siblings. On narrow screens
+   SillyTavern makes draggables full-screen, so they must stay on top there. */
 @media (min-width: 1001px) {
     #movingDivs > #gallery,
     #movingDivs > .galleryImageDraggable {
         z-index: 1 !important;
+    }
+
+    #movingDivs > #gallery.gpp-raised,
+    #movingDivs > .galleryImageDraggable.gpp-raised {
+        z-index: 2 !important;
     }
 }
 
@@ -182,6 +189,7 @@
     overscroll-behavior: contain;
     scrollbar-width: thin;
     transition: opacity 0.12s;
+    contain: layout style;
 }
 
 #gallery.gpp-busy .gpp-scroller {
@@ -245,7 +253,7 @@
 
 .gpp-tile.gpp-failed::after {
     content: '\f03e'; /* image icon */
-    font-family: 'Font Awesome 6 Free', 'Font Awesome 5 Free', sans-serif;
+    font-family: var(--fa-style-family-classic, 'Font Awesome 6 Free'), 'Font Awesome 6 Free', 'Font Awesome 5 Free', sans-serif;
     font-weight: 900;
     position: absolute;
     inset: 0;

@@ -9,8 +9,9 @@
  *  2. The data lived in the generic `extension_settings.gallery` blob that the built-in Gallery
  *     also owns. Gallery++ now owns `extension_settings.gallery_plus_plus`, and mirrors the
  *     folder map back into the legacy key so switching extensions never loses assignments.
- *  3. As a last line of defence a copy is kept in localStorage; if the server-side map ever comes
- *     back empty while the local copy is not, the assignments are restored from it.
+ *  3. As a last line of defence a copy is kept in localStorage (scoped per account in multi-user
+ *     mode); if the server-side map ever comes back empty while the local copy is not, the
+ *     assignments are restored from it.
  *  4. The settings object is re-validated on every access instead of once at start-up, so a late
  *     settings reload or a partially corrupt file can never leave the extension with undefined data.
  */
@@ -29,6 +30,7 @@ const SCHEMA_VERSION = 2;
  * @property {() => void} saveDebounced            Debounced settings save.
  * @property {() => (void|Promise<void>)} [saveNow] Immediate settings save (optional).
  * @property {Storage|null} [storage]              Storage used for the recovery copy.
+ * @property {string|null} [userScope]             Optional account handle to isolate multi-user backups.
  */
 
 /** @type {Host|null} */
@@ -52,6 +54,12 @@ function getStorage() {
     }
 }
 
+function getBackupKey() {
+    const scope = typeof host?.userScope === 'string' ? host.userScope.trim() : '';
+    if (scope && scope !== 'default-user') return `${LOCAL_BACKUP_KEY}.${scope}`;
+    return LOCAL_BACKUP_KEY;
+}
+
 /** Returns a copy containing only string → non-empty string entries. */
 function cleanFolderMap(map) {
     const out = {};
@@ -64,7 +72,7 @@ function cleanFolderMap(map) {
 
 function readBackup() {
     try {
-        const raw = getStorage()?.getItem(LOCAL_BACKUP_KEY);
+        const raw = getStorage()?.getItem(getBackupKey());
         return raw ? cleanFolderMap(JSON.parse(raw)) : {};
     } catch {
         return {};
@@ -73,10 +81,19 @@ function readBackup() {
 
 function writeBackup(folders) {
     try {
-        getStorage()?.setItem(LOCAL_BACKUP_KEY, JSON.stringify(folders));
+        getStorage()?.setItem(getBackupKey(), JSON.stringify(folders));
     } catch {
         // Storage may be full or disabled; the server-side copy is still authoritative.
     }
+}
+
+/** Removes the browser-side folder backup (used by the extension `clean` hook). */
+export function clearLocalBackup() {
+    try {
+        const storage = getStorage();
+        if (!storage) return;
+        storage.removeItem(getBackupKey());
+    } catch { /* ignore */ }
 }
 
 /** Mirrors the folder map into the legacy `gallery` key (kept for the built-in Gallery). */
@@ -93,6 +110,7 @@ export function getSettings() {
     if (!host) throw new Error('Gallery++ settings accessed before configureSettings()');
     const root = host.getRoot();
     let changed = false;
+    let foldersChanged = false;
 
     if (!isPlainObject(root[SETTINGS_KEY])) {
         root[SETTINGS_KEY] = {};
@@ -100,7 +118,7 @@ export function getSettings() {
     }
     const s = root[SETTINGS_KEY];
 
-    if (!isPlainObject(s.folders)) { s.folders = {}; changed = true; }
+    if (!isPlainObject(s.folders)) { s.folders = {}; changed = true; foldersChanged = true; }
     if (!SORT_VALUES.includes(s.sort)) { s.sort = 'dateAsc'; changed = true; }
     if (s.side !== 'left' && s.side !== 'right') { s.side = 'left'; changed = true; }
     if (typeof s.hotkeys !== 'boolean') { s.hotkeys = true; changed = true; }
@@ -126,6 +144,7 @@ export function getSettings() {
         }
         s.schema = SCHEMA_VERSION;
         changed = true;
+        foldersChanged = true;
     }
 
     // Recovery: the server-side map came back empty but the browser still remembers assignments.
@@ -138,34 +157,43 @@ export function getSettings() {
             if (Object.keys(backup).length > 0) {
                 s.folders = backup;
                 changed = true;
+                foldersChanged = true;
             }
         }
     }
 
     if (changed) {
-        mirrorToLegacy(root, s.folders);
-        writeBackup(s.folders);
+        if (foldersChanged) {
+            mirrorToLegacy(root, s.folders);
+            writeBackup(s.folders);
+        }
         host.saveDebounced();
     }
     return s;
 }
 
-/** Persists after a change. `immediate` bypasses the debounce for rare, important writes. */
-function commit({ immediate = false } = {}) {
+/** Persists after a change. `immediate` bypasses the debounce without causing a duplicate save. */
+function commit({ immediate = false, foldersChanged = false } = {}) {
     const s = getSettings();
-    mirrorToLegacy(host.getRoot(), s.folders);
-    writeBackup(s.folders);
-    host.saveDebounced();
+    if (foldersChanged) {
+        mirrorToLegacy(host.getRoot(), s.folders);
+        writeBackup(s.folders);
+    }
     if (immediate && typeof host.saveNow === 'function') {
         try {
             const result = host.saveNow();
             if (result && typeof result.catch === 'function') {
-                result.catch(error => console.warn('[Gallery++] Immediate settings save failed:', error));
+                result.catch(error => {
+                    console.warn('[Gallery++] Immediate settings save failed, falling back to debounced save:', error);
+                    host.saveDebounced();
+                });
             }
+            return;
         } catch (error) {
-            console.warn('[Gallery++] Immediate settings save failed:', error);
+            console.warn('[Gallery++] Immediate settings save failed, falling back to debounced save:', error);
         }
     }
+    host.saveDebounced();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -200,7 +228,7 @@ export function setFolderOverride(avatar, folder) {
     if (folder === null || String(folder).trim() === '') delete next[avatar];
     else next[avatar] = String(folder).trim();
     s.folders = next;
-    commit({ immediate: true });
+    commit({ immediate: true, foldersChanged: true });
 }
 
 /** Moves an assignment when ST renames a character's avatar file. */
@@ -213,7 +241,7 @@ export function renameAvatar(oldAvatar, newAvatar) {
     next[newAvatar] = folder;
     delete next[oldAvatar];
     s.folders = next;
-    commit({ immediate: true });
+    commit({ immediate: true, foldersChanged: true });
 }
 
 /** Forgets a deleted character's assignment. */
@@ -223,7 +251,7 @@ export function removeAvatar(avatar) {
     const next = { ...s.folders };
     delete next[avatar];
     s.folders = next;
-    commit({ immediate: true });
+    commit({ immediate: true, foldersChanged: true });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -231,13 +259,14 @@ export function removeAvatar(avatar) {
 // ---------------------------------------------------------------------------------------------
 
 export function getLayout() {
-    return normalizeLayout(getSettings());
+    const s = getSettings();
+    return { rows: s.rows, cols: s.cols, aspect: s.aspect };
 }
 
 /** @param {Partial<typeof LAYOUT_DEFAULTS>} partial @returns {typeof LAYOUT_DEFAULTS} */
 export function setLayout(partial) {
     const s = getSettings();
-    const merged = normalizeLayout({ ...normalizeLayout(s), ...partial });
+    const merged = normalizeLayout({ rows: s.rows, cols: s.cols, aspect: s.aspect, ...partial });
     Object.assign(s, merged);
     commit();
     return merged;

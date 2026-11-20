@@ -6,12 +6,13 @@
     "js": "index.js",
     "css": "style.css",
     "author": "City-Unit / Gallery++ community fork",
-    "version": "2.0.6",
+    "version": "2.1.0",
     "homePage": "https://github.com/serioos/Gallery-Plus-Plus",
     "auto_update": true,
     "minimum_client_version": "1.17.0",
-    "description": "A ground-up rewrite of SillyTavern's Gallery: configurable rows/columns and picture size, name search, jump-to-page navigation, fast cached thumbnails, and reliably persistent per-character folders.",
+    "description": "A ground-up rewrite of SillyTavern's Gallery: auto-fitted responsive grids, automatic picture-shape detection, name search, jump-to-page navigation, worker-encoded cached thumbnails, and reliably persistent per-character folders.",
     "hooks": {
-        "activate": "init"
+        "activate": "init",
+        "clean": "clean"
     }
 }
