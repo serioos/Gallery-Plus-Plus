@@ -2,6 +2,12 @@
 
 A ground-up rewrite of SillyTavern's Gallery extension, focused on speed, low resource usage, and ease of use.
 
+<img width="1920" height="951" alt="image" src="https://github.com/user-attachments/assets/ad623063-2bb3-43fd-b690-058e8a6f0800" />
+
+<img width="1920" height="951" alt="image" src="https://github.com/user-attachments/assets/22dbc260-4efe-4eff-95b1-cb71a67a7114" />
+
+<img width="1920" height="951" alt="image" src="https://github.com/user-attachments/assets/8c7dcc03-f43f-4b86-82e6-6b06b0670b70" />
+
 ## Install
 
 **Extensions → Install Extension**, paste `https://github.com/serioos/Gallery-Plus-Plus`, reload.
