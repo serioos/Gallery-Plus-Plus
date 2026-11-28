@@ -70,6 +70,13 @@ function cleanFolderMap(map) {
     return out;
 }
 
+function hasCorruptFolderEntries(map) {
+    for (const folder of Object.values(map)) {
+        if (typeof folder !== 'string' || folder.trim() === '') return true;
+    }
+    return false;
+}
+
 function readBackup() {
     try {
         const raw = getStorage()?.getItem(getBackupKey());
@@ -118,20 +125,33 @@ export function getSettings() {
     }
     const s = root[SETTINGS_KEY];
 
-    if (!isPlainObject(s.folders)) { s.folders = {}; changed = true; foldersChanged = true; }
-    if (!SORT_VALUES.includes(s.sort)) { s.sort = 'dateAsc'; changed = true; }
-    if (s.side !== 'left' && s.side !== 'right') { s.side = 'left'; changed = true; }
+    // Capture whether Gallery++ already had valid preferences before defaults are applied.
+    const hadSort = SORT_VALUES.includes(s.sort);
+    const hadSide = s.side === 'left' || s.side === 'right';
+
+    if (!isPlainObject(s.folders)) {
+        s.folders = {};
+        changed = true;
+        foldersChanged = true;
+    } else if (hasCorruptFolderEntries(s.folders)) {
+        s.folders = cleanFolderMap(s.folders);
+        changed = true;
+        foldersChanged = true;
+    }
+    if (!hadSort) { s.sort = 'dateAsc'; changed = true; }
+    if (!hadSide) { s.side = 'left'; changed = true; }
     if (typeof s.hotkeys !== 'boolean') { s.hotkeys = true; changed = true; }
     if (typeof s.showNames !== 'boolean') { s.showNames = false; changed = true; }
     if (typeof s.escKeepsOpen !== 'boolean') { s.escKeepsOpen = false; changed = true; }
     if (typeof s.cleanPictures !== 'boolean') { s.cleanPictures = true; changed = true; }
+    if (typeof s.muteVideos !== 'boolean') { s.muteVideos = false; changed = true; }
 
-    for (const stale of ['thumbWidth', 'thumbHeight']) { // replaced by the aspect-ratio option
-        if (stale in s) { delete s[stale]; changed = true; }
-    }
     const layout = normalizeLayout(s);
     for (const key of Object.keys(LAYOUT_DEFAULTS)) {
         if (s[key] !== layout[key]) { s[key] = layout[key]; changed = true; }
+    }
+    for (const stale of ['thumbWidth', 'thumbHeight', 'rows', 'cols']) { // replaced by aspect & orientation-specific grids
+        if (stale in s) { delete s[stale]; changed = true; }
     }
 
     if (s.schema !== SCHEMA_VERSION) {
@@ -139,8 +159,8 @@ export function getSettings() {
         const legacy = isPlainObject(root[LEGACY_KEY]) ? root[LEGACY_KEY] : null;
         if (legacy) {
             s.folders = { ...cleanFolderMap(legacy.folders), ...cleanFolderMap(s.folders) };
-            if (SORT_VALUES.includes(legacy.sort)) s.sort = legacy.sort;
-            if (legacy.side === 'left' || legacy.side === 'right') s.side = legacy.side;
+            if (!hadSort && SORT_VALUES.includes(legacy.sort)) s.sort = legacy.sort;
+            if (!hadSide && (legacy.side === 'left' || legacy.side === 'right')) s.side = legacy.side;
         }
         s.schema = SCHEMA_VERSION;
         changed = true;
@@ -204,7 +224,7 @@ function commit({ immediate = false, foldersChanged = false } = {}) {
 export function getFolderOverride(avatar) {
     if (!avatar) return undefined;
     const value = getSettings().folders[avatar];
-    return typeof value === 'string' && value !== '' ? value : undefined;
+    return typeof value === 'string' && value.trim() !== '' ? value : undefined;
 }
 
 /**
@@ -260,13 +280,26 @@ export function removeAvatar(avatar) {
 
 export function getLayout() {
     const s = getSettings();
-    return { rows: s.rows, cols: s.cols, aspect: s.aspect };
+    return {
+        portraitRows: s.portraitRows,
+        portraitCols: s.portraitCols,
+        landscapeRows: s.landscapeRows,
+        landscapeCols: s.landscapeCols,
+        aspect: s.aspect,
+    };
 }
 
 /** @param {Partial<typeof LAYOUT_DEFAULTS>} partial @returns {typeof LAYOUT_DEFAULTS} */
 export function setLayout(partial) {
     const s = getSettings();
-    const merged = normalizeLayout({ rows: s.rows, cols: s.cols, aspect: s.aspect, ...partial });
+    const merged = normalizeLayout({
+        portraitRows: s.portraitRows,
+        portraitCols: s.portraitCols,
+        landscapeRows: s.landscapeRows,
+        landscapeCols: s.landscapeCols,
+        aspect: s.aspect,
+        ...partial,
+    });
     Object.assign(s, merged);
     commit();
     return merged;
@@ -291,7 +324,7 @@ export function setSide(side) {
 
 export function getBoolean(key) { return Boolean(getSettings()[key]); }
 export function setBoolean(key, value) {
-    if (!['hotkeys', 'showNames', 'escKeepsOpen', 'cleanPictures'].includes(key)) return;
+    if (!['hotkeys', 'showNames', 'escKeepsOpen', 'cleanPictures', 'muteVideos'].includes(key)) return;
     getSettings()[key] = Boolean(value);
     commit();
 }

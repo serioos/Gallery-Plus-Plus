@@ -2,8 +2,8 @@
  * Gallery++ — thumbnail service.
  * SPDX-License-Identifier: AGPL-3.0-or-later
  *
- * - Thumbnails are small WebP blobs persisted in IndexedDB along with original {w, h} dimensions
- *   and a server version signature (ETag / Last-Modified / Content-Length).
+ * - Thumbnails are small WebP blobs persisted in IndexedDB (scoped per user in multi-user mode)
+ *   along with original {w, h} dimensions and a server version signature (ETag / Last-Modified / Content-Length).
  * - Image fetch, decoding, resizing, and WebP encoding run off the main thread in a lightweight
  *   Web Worker that auto-terminates after an idle period (with transparent main-thread fallback).
  * - IndexedDB reads are batched per page (one transaction) and writes are coalesced into periodic
@@ -16,7 +16,7 @@
 import { getVideoThumbnail } from '../../../utils.js';
 import { THUMB_BUCKETS, parseImageDimensions } from './lib.js';
 
-const DB_NAME = 'ST_Gallery_Cache';
+const DEFAULT_DB_NAME = 'ST_Gallery_Cache';
 const DB_VERSION = 2;
 const STORE = 'thumbs2';
 const LEGACY_STORE = 'thumbnails'; // v1 stored bulky data-URL strings; dropped on upgrade
@@ -24,6 +24,8 @@ const MAX_DB_ENTRIES = 4000;
 const PRUNE_EVERY_WRITES = 40;
 const MEMORY_LIMIT = 400;
 const OBJECT_URL_LIMIT = 200; // > max pageSize (12x12 = 144), so active page + previous page stay hot
+const SIGNATURE_LIMIT = 2000;
+const PURGE_MAP_LIMIT = 500;
 const CONCURRENCY = 3;
 const HEAD_CONCURRENCY = 4;
 const VIDEO_TIMEOUT_MS = 15_000;
@@ -33,6 +35,7 @@ const LRU_TOUCH_MS = 24 * 60 * 60 * 1000;
 const PUT_FLUSH_MS = 180;
 const PUT_FLUSH_BATCH = 24;
 const WORKER_IDLE_MS = 60_000;
+const MAX_WORKER_RESTARTS = 3;
 const PROBE_MAX_BYTES = 65_536;
 
 /**
@@ -50,17 +53,95 @@ const signatures = new Map();
 const signatureInFlight = new Map();
 /** @type {Map<string, RefCountedJob<ThumbnailHit|null>>} */
 const renderInFlight = new Map();
-/** @type {Map<string, {blob: Blob, v: string|null, w: number, h: number, t: number}>} */
+/** @type {Map<string, {blob: Blob, v: string|null, w: number, h: number, t: number, seq: number}>} */
 const pendingPuts = new Map();
+/** @type {Map<string, number>} per-src purge sequence numbers for targeted invalidation */
+const purgedSrcSeq = new Map();
+/** @type {Map<string, number>} per-folder-prefix purge sequence numbers for targeted invalidation */
+const purgedPrefixSeq = new Map();
 
+let activeDbName = DEFAULT_DB_NAME;
 let putFlushTimer = 0;
 let writesSincePrune = 0;
 let pruning = false;
 let cacheEpoch = 0;
+let purgeSeq = 0;
 /** @type {Promise<IDBDatabase>|null} */
 let dbPromise = null;
 
 const keyOf = (src, bucket) => `${src}|${bucket}`;
+
+function srcFromKey(key) {
+    const sep = key.lastIndexOf('|');
+    return sep >= 0 ? key.slice(0, sep) : key;
+}
+
+function recordSrcPurge(src, seq = ++purgeSeq) {
+    purgedSrcSeq.delete(src);
+    purgedSrcSeq.set(src, seq);
+    while (purgedSrcSeq.size > PURGE_MAP_LIMIT) {
+        purgedSrcSeq.delete(purgedSrcSeq.keys().next().value);
+    }
+}
+
+function recordPrefixPurge(prefix) {
+    const seq = ++purgeSeq;
+    purgedPrefixSeq.delete(prefix);
+    purgedPrefixSeq.set(prefix, seq);
+    while (purgedPrefixSeq.size > PURGE_MAP_LIMIT) {
+        purgedPrefixSeq.delete(purgedPrefixSeq.keys().next().value);
+    }
+}
+
+function isPurgedSince(src, sinceSeq) {
+    if ((purgedSrcSeq.get(src) ?? 0) > sinceSeq) return true;
+    for (const [prefix, seq] of purgedPrefixSeq) {
+        if (seq > sinceSeq && src.startsWith(prefix)) return true;
+    }
+    return false;
+}
+
+function setSignature(src, sig) {
+    const now = Date.now();
+    signatures.delete(src);
+    signatures.set(src, { sig, time: now });
+    if (signatures.size > SIGNATURE_LIMIT) {
+        for (const [k, entry] of signatures) {
+            if (now - entry.time >= SIGNATURE_TTL_MS) signatures.delete(k);
+            if (signatures.size <= SIGNATURE_LIMIT) break;
+        }
+        while (signatures.size > SIGNATURE_LIMIT) {
+            signatures.delete(signatures.keys().next().value);
+        }
+    }
+}
+
+/**
+ * Configures multi-user cache isolation by scoping the IndexedDB database name to `userScope`.
+ * @param {{userScope?: string|null}} [options]
+ */
+export function configureThumbs({ userScope } = {}) {
+    const scope = typeof userScope === 'string' ? userScope.trim() : '';
+    const nextDbName = scope && scope !== 'default-user' ? `${DEFAULT_DB_NAME}_${scope}` : DEFAULT_DB_NAME;
+    if (nextDbName === activeDbName) return;
+
+    cacheEpoch++;
+    clearTimeout(putFlushTimer);
+    putFlushTimer = 0;
+    pendingPuts.clear();
+    for (const [key, entry] of memory.entries()) revokeKeyUrl(key, entry);
+    memory.clear();
+    liveObjectUrls.clear();
+    signatures.clear();
+    purgedSrcSeq.clear();
+    purgedPrefixSeq.clear();
+    if (dbPromise) {
+        const oldPromise = dbPromise;
+        dbPromise = null;
+        oldPromise.then(db => db.close()).catch(() => {});
+    }
+    activeDbName = nextDbName;
+}
 
 /** Returns candidate buckets >= requested bucket, exact match first, ascending. */
 function candidateBuckets(bucket) {
@@ -146,13 +227,30 @@ function extractSignature(headers) {
     return parts.some(Boolean) ? parts.map(p => p ?? '').join('|') : null;
 }
 
+/** Synchronously decodes a data: URL into a Blob without triggering a synthetic fetch() (CSP-safe). */
+function dataUrlToBlob(dataUrl) {
+    const match = /^data:([^;,]*)(;base64)?,(.*)$/s.exec(String(dataUrl));
+    if (!match) throw new Error('Invalid data URL');
+    const type = match[1] || 'application/octet-stream';
+    const isBase64 = Boolean(match[2]);
+    const payload = match[3];
+    if (isBase64) {
+        const binary = atob(payload);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return new Blob([bytes], { type });
+    }
+    return new Blob([decodeURIComponent(payload)], { type });
+}
+
 // ------------------------------------------------------------------------------ IndexedDB
 
 function openDB() {
     if (typeof indexedDB === 'undefined') return Promise.reject(new Error('IndexedDB unavailable'));
     if (!dbPromise) {
+        const name = activeDbName;
         dbPromise = new Promise((resolve, reject) => {
-            const request = indexedDB.open(DB_NAME, DB_VERSION);
+            const request = indexedDB.open(name, DB_VERSION);
             request.onupgradeneeded = () => {
                 const db = request.result;
                 if (db.objectStoreNames.contains(LEGACY_STORE)) db.deleteObjectStore(LEGACY_STORE);
@@ -181,7 +279,7 @@ const wrap = (request) => new Promise((resolve, reject) => {
 });
 
 function scheduleDbPut(key, blob, v, w = 0, h = 0) {
-    pendingPuts.set(key, { blob, v: v ?? null, w: w || 0, h: h || 0, t: Date.now() });
+    pendingPuts.set(key, { blob, v: v ?? null, w: w || 0, h: h || 0, t: Date.now(), seq: purgeSeq });
     if (pendingPuts.size >= PUT_FLUSH_BATCH) {
         clearTimeout(putFlushTimer);
         putFlushTimer = 0;
@@ -194,6 +292,19 @@ function scheduleDbPut(key, blob, v, w = 0, h = 0) {
     }
 }
 
+function writePutBatch(db, entries) {
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE, 'readwrite');
+        const store = tx.objectStore(STORE);
+        for (const [key, row] of entries) {
+            store.put({ blob: row.blob, v: row.v, w: row.w, h: row.h, t: row.t }, key);
+        }
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error ?? new Error('aborted'));
+    });
+}
+
 async function flushDbPuts() {
     if (pendingPuts.size === 0) return;
     const epoch = cacheEpoch;
@@ -202,25 +313,27 @@ async function flushDbPuts() {
     try {
         const db = await openDB();
         if (epoch !== cacheEpoch) return;
-        await new Promise((resolve, reject) => {
-            const tx = db.transaction(STORE, 'readwrite');
-            const store = tx.objectStore(STORE);
-            for (const [key, row] of batch) store.put(row, key);
-            tx.oncomplete = resolve;
-            tx.onerror = () => reject(tx.error);
-            tx.onabort = () => reject(tx.error ?? new Error('aborted'));
-        });
-        writesSincePrune += batch.length;
+        const valid = batch.filter(([key, row]) => !isPurgedSince(srcFromKey(key), row.seq));
+        if (valid.length === 0) return;
+        try {
+            await writePutBatch(db, valid);
+        } catch (error) {
+            if (error?.name !== 'QuotaExceededError') throw error;
+            await prune(0.6);
+            if (epoch !== cacheEpoch) return;
+            const retryValid = valid.filter(([key, row]) => !isPurgedSince(srcFromKey(key), row.seq));
+            if (retryValid.length === 0) return;
+            const retryDb = await openDB();
+            if (epoch !== cacheEpoch) return;
+            await writePutBatch(retryDb, retryValid);
+        }
+        writesSincePrune += valid.length;
         if (writesSincePrune >= PRUNE_EVERY_WRITES) {
             writesSincePrune = 0;
             void prune();
         }
     } catch (error) {
-        if (error?.name === 'QuotaExceededError') {
-            void prune(0.6);
-        } else {
-            console.debug('[Gallery++] Could not persist thumbnails:', error);
-        }
+        console.debug('[Gallery++] Could not persist thumbnails:', error);
     }
 }
 
@@ -285,6 +398,41 @@ async function dbGetBest(src, bucket) {
     }
 }
 
+/** Deletes all cached buckets for `src` except `keepBucket` from RAM, pending writes, and IndexedDB. */
+async function purgeOtherBuckets(src, keepBucket) {
+    const keepKey = keyOf(src, keepBucket);
+    const prefix = `${src}|`;
+    for (const [key, entry] of [...memory.entries()]) {
+        if (key.startsWith(prefix) && key !== keepKey) {
+            revokeKeyUrl(key, entry);
+            memory.delete(key);
+        }
+    }
+    for (const key of [...pendingPuts.keys()]) {
+        if (key.startsWith(prefix) && key !== keepKey) pendingPuts.delete(key);
+    }
+    try {
+        const db = await openDB();
+        await new Promise((resolve, reject) => {
+            const tx = db.transaction(STORE, 'readwrite');
+            const store = tx.objectStore(STORE);
+            const cursorReq = store.openKeyCursor(IDBKeyRange.bound(prefix, `${prefix}\uffff`));
+            cursorReq.onsuccess = () => {
+                const cursor = cursorReq.result;
+                if (cursor) {
+                    if (cursor.key !== keepKey) store.delete(cursor.key);
+                    cursor.continue();
+                }
+            };
+            tx.oncomplete = resolve;
+            tx.onerror = () => reject(tx.error);
+            tx.onabort = () => reject(tx.error ?? new Error('aborted'));
+        });
+    } catch (error) {
+        console.debug('[Gallery++] Could not purge stale thumbnail buckets:', error);
+    }
+}
+
 // ----------------------------------------------------------------------------- priority queues & ref-counted jobs
 
 function createQueue(concurrency) {
@@ -328,7 +476,7 @@ function createQueue(concurrency) {
             const job = {
                 priority,
                 cleanup,
-                run: () => (signal?.aborted ? Promise.resolve(null) : task()).then(resolve, reject),
+                run: () => Promise.resolve().then(() => (signal?.aborted ? null : task())).then(resolve, reject),
             };
             signal?.addEventListener('abort', onAbort, { once: true });
             // Insert ahead of lower-priority queued items while keeping FIFO within the same priority.
@@ -428,7 +576,7 @@ function currentSignature(src, signal) {
             const response = await fetch(src, { method: 'HEAD', credentials: 'same-origin', cache: 'no-cache', signal: jobSignal });
             if (!response.ok) return null;
             const sig = extractSignature(response.headers);
-            if (sig !== null) signatures.set(src, { sig, time: Date.now() });
+            setSignature(src, sig);
             return sig;
         } catch {
             return null;
@@ -448,6 +596,8 @@ export function invalidateThumbnailChecks() {
 
 const WORKER_SOURCE = `
 const controllers = new Map();
+let sharedCanvas = null;
+let sharedCtx = null;
 function extractSig(headers) {
     const parts = [headers.get('etag'), headers.get('last-modified'), headers.get('content-length')];
     return parts.some(Boolean) ? parts.map(p => p ?? '').join('|') : null;
@@ -488,13 +638,20 @@ self.onmessage = async (event) => {
             }
             const tw = Math.max(1, Math.round(w * scale));
             const th = Math.max(1, Math.round(h * scale));
-            const canvas = new OffscreenCanvas(tw, th);
-            const ctx = canvas.getContext('2d');
-            if (!ctx) { self.postMessage({ id, ok: false, fallback: true, original, sig }); return; }
-            ctx.imageSmoothingQuality = 'high';
-            ctx.drawImage(bitmap, 0, 0, tw, th);
+            if (!sharedCanvas) {
+                sharedCanvas = new OffscreenCanvas(tw, th);
+                sharedCtx = sharedCanvas.getContext('2d');
+            } else if (sharedCanvas.width !== tw || sharedCanvas.height !== th) {
+                sharedCanvas.width = tw;
+                sharedCanvas.height = th;
+            } else if (sharedCtx) {
+                sharedCtx.clearRect(0, 0, tw, th);
+            }
+            if (!sharedCtx) { self.postMessage({ id, ok: false, fallback: true, original, sig }); return; }
+            sharedCtx.imageSmoothingQuality = 'high';
+            sharedCtx.drawImage(bitmap, 0, 0, tw, th);
             if (ctl.signal.aborted) { self.postMessage({ id, ok: false, aborted: true }); return; }
-            const blob = await canvas.convertToBlob({ type: 'image/webp', quality });
+            const blob = await sharedCanvas.convertToBlob({ type: 'image/webp', quality });
             if (ctl.signal.aborted) { self.postMessage({ id, ok: false, aborted: true }); return; }
             self.postMessage({ id, ok: true, blob, w, h, sig });
         } finally {
@@ -510,6 +667,7 @@ self.onmessage = async (event) => {
 `;
 
 let workerUnsupported = typeof Worker !== 'function' || typeof OffscreenCanvas !== 'function' || typeof createImageBitmap !== 'function';
+let workerErrorCount = 0;
 /** @type {Worker|null} */
 let worker = null;
 /** @type {string|null} */
@@ -519,7 +677,7 @@ let workerIdleTimer = 0;
 /** @type {Map<number, {resolve: (v: any) => void, reject: (e: any) => void}>} */
 const workerPending = new Map();
 
-function terminateWorker() {
+function terminateWorker(crashed = false) {
     clearTimeout(workerIdleTimer);
     workerIdleTimer = 0;
     if (worker) {
@@ -530,7 +688,11 @@ function terminateWorker() {
         URL.revokeObjectURL(workerScriptUrl);
         workerScriptUrl = null;
     }
-    for (const pending of workerPending.values()) pending.reject(new Error('Worker terminated'));
+    for (const pending of workerPending.values()) {
+        const err = new Error(crashed ? 'Worker crashed' : 'Worker terminated');
+        /** @type {any} */ (err).workerTerminated = true;
+        pending.reject(err);
+    }
     workerPending.clear();
 }
 
@@ -538,8 +700,14 @@ function scheduleWorkerIdle() {
     clearTimeout(workerIdleTimer);
     if (workerPending.size > 0 || !worker) return;
     workerIdleTimer = setTimeout(() => {
-        if (workerPending.size === 0) terminateWorker();
+        if (workerPending.size === 0) terminateWorker(false);
     }, WORKER_IDLE_MS);
+}
+
+function handleWorkerCrash() {
+    workerErrorCount++;
+    if (workerErrorCount >= MAX_WORKER_RESTARTS) workerUnsupported = true;
+    terminateWorker(true);
 }
 
 function getWorker() {
@@ -557,13 +725,11 @@ function getWorker() {
                 entry.resolve(msg);
                 scheduleWorkerIdle();
             };
-            worker.onerror = () => {
-                workerUnsupported = true;
-                terminateWorker();
-            };
+            worker.onerror = handleWorkerCrash;
+            worker.onmessageerror = handleWorkerCrash;
         } catch {
             workerUnsupported = true;
-            terminateWorker();
+            terminateWorker(true);
             return null;
         }
     }
@@ -663,7 +829,7 @@ async function renderImageThumbnail(src, bucket, signal) {
             }
             throw new Error(msg.message || 'Worker thumbnail render failed');
         } catch (error) {
-            if (!workerUnsupported) throw error;
+            if (!workerUnsupported && !error?.workerTerminated) throw error;
             // Worker failed to initialize / crashed: fall through to main thread.
         }
     }
@@ -682,22 +848,34 @@ async function renderVideoThumbnail(src, bucket, signal) {
     const sig = await currentSignature(src, signal);
     if (signal?.aborted) return null;
     let timer = 0;
+    /** @type {(() => void)|null} */
+    let onAbort = null;
     try {
-        const dataUrl = await Promise.race([
+        const racers = [
             getVideoThumbnail(src, bucket, bucket, 'image/webp'),
             new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Video thumbnail timed out')), VIDEO_TIMEOUT_MS); }),
-        ]);
+        ];
+        if (signal) {
+            racers.push(new Promise((resolve) => {
+                if (signal.aborted) { resolve(null); return; }
+                onAbort = () => resolve(null);
+                signal.addEventListener('abort', onAbort, { once: true });
+            }));
+        }
+        const dataUrl = await Promise.race(racers);
         if (!dataUrl || signal?.aborted) return null;
-        const blob = await (await fetch(dataUrl)).blob();
+        const blob = dataUrlToBlob(dataUrl);
         return { blob, w: 0, h: 0, sig };
     } finally {
         clearTimeout(timer);
+        if (onAbort) signal?.removeEventListener('abort', onAbort);
     }
 }
 
 async function generateAndStore(src, { video, bucket, signal, priority = 1 }) {
     const key = keyOf(src, bucket);
     const epoch = cacheEpoch;
+    const seq = purgeSeq;
 
     return attachJob(renderInFlight, key, (jobSignal) => renderQueue.enqueue(async () => {
         try {
@@ -705,8 +883,8 @@ async function generateAndStore(src, { video, bucket, signal, priority = 1 }) {
                 ? await renderVideoThumbnail(src, bucket, jobSignal)
                 : await renderImageThumbnail(src, bucket, jobSignal);
             if (!result?.blob || jobSignal.aborted) return null;
-            if (result.sig !== null) signatures.set(src, { sig: result.sig, time: Date.now() });
-            if (epoch !== cacheEpoch) return null; // purged or cleared while generating
+            if (epoch !== cacheEpoch || isPurgedSince(src, seq)) return null; // purged or cleared while generating
+            setSignature(src, result.sig);
             const entry = remember(key, result.blob, result.sig, result.w, result.h);
             scheduleDbPut(key, result.blob, result.sig, result.w, result.h);
             return toHit(src, key, entry);
@@ -757,6 +935,7 @@ export async function prefetchPageFromDB(srcs, bucket) {
     const hits = new Map();
     if (!srcs.length) return hits;
     const epoch = cacheEpoch;
+    const seq = purgeSeq;
     const buckets = candidateBuckets(bucket);
     try {
         const db = await openDB();
@@ -780,6 +959,7 @@ export async function prefetchPageFromDB(srcs, bucket) {
         if (epoch !== cacheEpoch) return hits;
         const now = Date.now();
         for (const [src, arr] of raw) {
+            if (isPurgedSince(src, seq)) continue;
             for (let i = 0; i < buckets.length; i++) {
                 const row = arr[i];
                 if (row?.blob instanceof Blob) {
@@ -815,11 +995,13 @@ export async function revalidateThumbnail(src, { video, bucket, signal }) {
     if (signal?.aborted) return null;
     if (isCurrent(found.entry, sig)) return null;
 
-    // File changed on the server: evict stale entry and regenerate.
-    revokeKeyUrl(found.key, found.entry);
-    memory.delete(found.key);
-    pendingPuts.delete(found.key);
-    return generateAndStore(src, { video, bucket, signal, priority: 1 });
+    // File changed on the server: keep the live tile intact until replacement succeeds,
+    // then purge any stale entries in other resolution buckets from RAM and IndexedDB.
+    const fresh = await generateAndStore(src, { video, bucket, signal, priority: 1 });
+    if (fresh) {
+        await purgeOtherBuckets(src, bucket);
+    }
+    return fresh;
 }
 
 /**
@@ -838,9 +1020,10 @@ export async function getThumbnail(src, { video, bucket, signal, priority = 1, s
             return toHit(src, mem.key, entry);
         }
         const epoch = cacheEpoch;
+        const seq = purgeSeq;
         const fromDb = await dbGetBest(src, bucket);
         if (signal?.aborted) return null;
-        if (fromDb && epoch === cacheEpoch) {
+        if (fromDb && epoch === cacheEpoch && !isPurgedSince(src, seq)) {
             const { key, row } = fromDb;
             const entry = remember(key, row.blob, row.v ?? null, row.w || 0, row.h || 0);
             if (!row.t || Date.now() - row.t > LRU_TOUCH_MS) {
@@ -909,7 +1092,7 @@ export async function probeImageDimensions(src, signal) {
 
 /** Removes every cached size of one file (after it was deleted). */
 export async function purgeThumbnail(src) {
-    cacheEpoch++;
+    recordSrcPurge(src);
     signatures.delete(src);
     const prefix = `${src}|`;
     for (const [key, entry] of [...memory.entries()]) {
@@ -937,7 +1120,7 @@ export async function purgeThumbnail(src) {
 /** Removes every cached size of every file under a folder URL prefix (single IDB range delete). */
 export async function purgeFolderThumbnails(folderUrlPrefix) {
     if (!folderUrlPrefix) return;
-    cacheEpoch++;
+    recordPrefixPurge(folderUrlPrefix);
     for (const src of [...signatures.keys()]) {
         if (src.startsWith(folderUrlPrefix)) signatures.delete(src);
     }
@@ -968,20 +1151,19 @@ export async function purgeFolderThumbnails(folderUrlPrefix) {
 export async function purgeThumbnails(srcs) {
     const srcSet = new Set(srcs);
     if (srcSet.size === 0) return;
-    cacheEpoch++;
-    for (const src of srcSet) signatures.delete(src);
+    const seq = ++purgeSeq;
+    for (const src of srcSet) {
+        recordSrcPurge(src, seq);
+        signatures.delete(src);
+    }
     for (const [key, entry] of [...memory.entries()]) {
-        const sep = key.lastIndexOf('|');
-        const src = sep >= 0 ? key.slice(0, sep) : key;
-        if (srcSet.has(src)) {
+        if (srcSet.has(srcFromKey(key))) {
             revokeKeyUrl(key, entry);
             memory.delete(key);
         }
     }
     for (const key of [...pendingPuts.keys()]) {
-        const sep = key.lastIndexOf('|');
-        const src = sep >= 0 ? key.slice(0, sep) : key;
-        if (srcSet.has(src)) pendingPuts.delete(key);
+        if (srcSet.has(srcFromKey(key))) pendingPuts.delete(key);
     }
     try {
         const db = await openDB();
@@ -1008,6 +1190,8 @@ export async function clearThumbnailCache() {
     memory.clear();
     liveObjectUrls.clear();
     signatures.clear();
+    purgedSrcSeq.clear();
+    purgedPrefixSeq.clear();
     try {
         const db = await openDB();
         const count = await wrap(db.transaction(STORE, 'readonly').objectStore(STORE).count());
@@ -1024,19 +1208,22 @@ export async function deleteThumbnailDatabase() {
     clearTimeout(putFlushTimer);
     putFlushTimer = 0;
     pendingPuts.clear();
-    terminateWorker();
+    terminateWorker(false);
     for (const [key, entry] of memory.entries()) revokeKeyUrl(key, entry);
     memory.clear();
     liveObjectUrls.clear();
     signatures.clear();
+    purgedSrcSeq.clear();
+    purgedPrefixSeq.clear();
     if (dbPromise) {
         try { (await dbPromise).close(); } catch { /* ignore */ }
         dbPromise = null;
     }
     if (typeof indexedDB === 'undefined') return;
+    const name = activeDbName;
     await Promise.race([
         new Promise((resolve) => {
-            const req = indexedDB.deleteDatabase(DB_NAME);
+            const req = indexedDB.deleteDatabase(name);
             req.onsuccess = req.onerror = req.onblocked = () => resolve();
         }),
         new Promise((resolve) => setTimeout(resolve, 2000)),

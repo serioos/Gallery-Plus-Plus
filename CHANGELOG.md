@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.1.0
+### New & Performance
+- **Off-thread Web Worker thumbnail encoding** with reusable `OffscreenCanvas`, automatic idle termination, and resilient main-thread fallback.
+- **Separate Portrait and Landscape grids** (`portraitRows`/`portraitCols` and `landscapeRows`/`landscapeCols`) that switch automatically based on the active picture aspect ratio.
+- **New option: "Automatically mute videos"** (Extensions tab > Gallery++).
+- **Batched IndexedDB reads and writes** (`prefetchPageFromDB`, coalesced batch puts with `QuotaExceededError` prune-and-retry, and key-only cursor pruning) plus idle next-page prefetching.
+- **Fast HTTP Range header probing** (<= 64 KB) for automatic picture-shape detection, supporting PNG, GIF, WebP, BMP (including OS/2 `BITMAPCOREHEADER`), and JPEG with EXIF Orientation handling.
+- **Bounded parallel uploads** (up to 3 concurrent files) and cached `null` HEAD signatures for servers without ETag/Last-Modified/Content-Length headers.
+- **SillyTavern 1.17+ `clean` lifecycle hook** that tears down all listeners, `ResizeObserver`, mounted UI elements, caches, and scoped browser storage.
+
+### Fixes & Accessibility
+- **Multi-user isolation**: scoped IndexedDB thumbnail database and `localStorage` aspect hints per SillyTavern account (`userScope`).
+- **Cache freshness & concurrency**: fixed `revalidateThumbnail()` early blob URL revocation and stale higher-bucket IndexedDB cleanup; replaced global `cacheEpoch++` on targeted purges with per-key/per-prefix invalidation; fixed abort handling in `renderVideoThumbnail()`, sync throws in `createQueue()`, and `onmessageerror` / restart recovery in the Web Worker.
+- **Settings migration & validation**: preserved existing Gallery++ `sort` and `side` preferences during schema v2 migration and pruned blank/corrupt entries from the folder map.
+- **UI & async race fixes**: fixed `openMedia()` cached-video metadata race and autoplay mute ordering, rapid `openGallery()` double-open race, `deleteItem()` folder-switch race, `applyFolderChoice()` premature UI update and error toast, per-field layout debounce, dragged-side toggle sync, mobile bucket-growth re-rendering, bottom-clipped folder suggestions, drag-drop highlight reset, and `pickAspectSamples()` stride sampling.
+- **Accessibility & i18n**: added keyboard focus and `Enter`/`Space` activation to custom `role="button"` controls, styled `.right_menu_button.disabled`, fixed `/list-gallery group=` matching by name or ID, converted fragmented labels to interpolated `t` strings, and synced `index.i18n.html`.
+
 ## 2.0.6
 - **New option: "Esc never closes opened pictures or the gallery"** (Extensions tab > Gallery++).
 - **Fixed:** pressing Esc to cancel a message edit (or to leave a text field) no longer closes opened pictures or the gallery, regardless of the option.

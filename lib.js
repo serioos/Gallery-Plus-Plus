@@ -5,8 +5,10 @@
 
 /** Allowed ranges for the user-configurable grid layout. */
 export const LAYOUT_LIMITS = Object.freeze({
-    rows: { min: 1, max: 12 },
-    cols: { min: 1, max: 12 },
+    portraitRows: { min: 1, max: 12 },
+    portraitCols: { min: 1, max: 12 },
+    landscapeRows: { min: 1, max: 12 },
+    landscapeCols: { min: 1, max: 12 },
 });
 
 /** Picture shapes offered in the options (width:height). 'auto' is handled separately. */
@@ -18,8 +20,10 @@ export const ASPECT_PRESETS = Object.freeze([
 }));
 
 export const LAYOUT_DEFAULTS = Object.freeze({
-    rows: 3,
-    cols: 4,
+    portraitRows: 3,
+    portraitCols: 4,
+    landscapeRows: 4,
+    landscapeCols: 2,
     aspect: 'auto',
 });
 
@@ -86,11 +90,34 @@ export function dominantAspect(ratios) {
  */
 export function normalizeLayout(raw) {
     const src = raw && typeof raw === 'object' ? raw : {};
+    const portraitRowsRaw = src.portraitRows ?? src.rows;
+    const portraitColsRaw = src.portraitCols ?? src.cols;
     return {
-        rows: clampInt(src.rows, LAYOUT_LIMITS.rows.min, LAYOUT_LIMITS.rows.max, LAYOUT_DEFAULTS.rows),
-        cols: clampInt(src.cols, LAYOUT_LIMITS.cols.min, LAYOUT_LIMITS.cols.max, LAYOUT_DEFAULTS.cols),
+        portraitRows: clampInt(portraitRowsRaw, LAYOUT_LIMITS.portraitRows.min, LAYOUT_LIMITS.portraitRows.max, LAYOUT_DEFAULTS.portraitRows),
+        portraitCols: clampInt(portraitColsRaw, LAYOUT_LIMITS.portraitCols.min, LAYOUT_LIMITS.portraitCols.max, LAYOUT_DEFAULTS.portraitCols),
+        landscapeRows: clampInt(src.landscapeRows, LAYOUT_LIMITS.landscapeRows.min, LAYOUT_LIMITS.landscapeRows.max, LAYOUT_DEFAULTS.landscapeRows),
+        landscapeCols: clampInt(src.landscapeCols, LAYOUT_LIMITS.landscapeCols.min, LAYOUT_LIMITS.landscapeCols.max, LAYOUT_DEFAULTS.landscapeCols),
         aspect: isValidAspect(src.aspect) ? src.aspect : LAYOUT_DEFAULTS.aspect,
     };
+}
+
+/** True when a width/height ratio is wider than tall (landscape). */
+export function isLandscapeRatio(ratio) {
+    return Number.isFinite(ratio) && ratio > 1;
+}
+
+/**
+ * Picks the portrait or landscape rows/columns for the active tile ratio.
+ * Square (1:1) and portrait (< 1) ratios use the portrait grid; ratios > 1 use the landscape grid.
+ * @param {typeof LAYOUT_DEFAULTS} layout
+ * @param {number} ratio
+ * @returns {{rows: number, cols: number, orientation: 'portrait'|'landscape'}}
+ */
+export function resolveGridForRatio(layout, ratio) {
+    if (isLandscapeRatio(ratio)) {
+        return { rows: layout.landscapeRows, cols: layout.landscapeCols, orientation: 'landscape' };
+    }
+    return { rows: layout.portraitRows, cols: layout.portraitCols, orientation: 'portrait' };
 }
 
 /** Number of pages; always at least 1 so an empty gallery still shows "1 / 1". */
@@ -234,7 +261,52 @@ export function sanitizeHTMLId(text) {
 }
 
 /**
+ * Parses EXIF Orientation (tag 0x0112) from a JPEG APP1 segment payload (starting at "Exif\0\0").
+ * Returns 1..8 when found, or 1 otherwise.
+ * @param {Uint8Array} bytes
+ * @param {number} start Offset of "Exif\0\0"
+ * @param {number} end Exclusive end offset of the APP1 segment
+ * @returns {number}
+ */
+function parseExifOrientation(bytes, start, end) {
+    if (start + 14 > end) return 1;
+    // "Exif\0\0"
+    if (bytes[start] !== 0x45 || bytes[start + 1] !== 0x78 || bytes[start + 2] !== 0x69
+        || bytes[start + 3] !== 0x66 || bytes[start + 4] !== 0x00 || bytes[start + 5] !== 0x00) {
+        return 1;
+    }
+    const tiff = start + 6;
+    const little = bytes[tiff] === 0x49 && bytes[tiff + 1] === 0x49; // 'II'
+    const big = bytes[tiff] === 0x4D && bytes[tiff + 1] === 0x4D;    // 'MM'
+    if (!little && !big) return 1;
+
+    const u16 = (o) => little
+        ? (bytes[o] | (bytes[o + 1] << 8))
+        : ((bytes[o] << 8) | bytes[o + 1]);
+    const u32 = (o) => little
+        ? ((bytes[o] | (bytes[o + 1] << 8) | (bytes[o + 2] << 16) | (bytes[o + 3] << 24)) >>> 0)
+        : (((bytes[o] << 24) | (bytes[o + 1] << 16) | (bytes[o + 2] << 8) | bytes[o + 3]) >>> 0);
+
+    if (u16(tiff + 2) !== 0x002A) return 1;
+    const ifdOffset = u32(tiff + 4);
+    const ifd = tiff + ifdOffset;
+    if (ifd < tiff || ifd + 2 > end) return 1;
+
+    const entries = u16(ifd);
+    for (let i = 0; i < entries; i++) {
+        const entry = ifd + 2 + i * 12;
+        if (entry + 12 > end) break;
+        if (u16(entry) === 0x0112) {
+            const val = u16(entry + 8);
+            return val >= 1 && val <= 8 ? val : 1;
+        }
+    }
+    return 1;
+}
+
+/**
  * Extracts image width & height from the leading bytes of PNG, JPEG, WebP, GIF, or BMP files.
+ * Accounts for JPEG EXIF Orientation (tags 5–8 swap width and height) and OS/2 BMP headers.
  * Returns null if the format is unrecognized or more bytes are required.
  * @param {Uint8Array} bytes
  * @returns {{w: number, h: number}|null}
@@ -245,6 +317,7 @@ export function parseImageDimensions(bytes) {
     const u16be = (o) => (bytes[o] << 8) | bytes[o + 1];
     const u16le = (o) => bytes[o] | (bytes[o + 1] << 8);
     const u32be = (o) => ((bytes[o] << 24) | (bytes[o + 1] << 16) | (bytes[o + 2] << 8) | bytes[o + 3]) >>> 0;
+    const u32le = (o) => (bytes[o] | (bytes[o + 1] << 8) | (bytes[o + 2] << 16) | (bytes[o + 3] << 24)) >>> 0;
     const i32le = (o) => (bytes[o] | (bytes[o + 1] << 8) | (bytes[o + 2] << 16) | (bytes[o + 3] << 24)) | 0;
 
     // PNG: 89 50 4E 47 0D 0A 1A 0A, IHDR width/height at offsets 16 and 20
@@ -290,16 +363,26 @@ export function parseImageDimensions(bytes) {
         return null;
     }
 
-    // BMP: 'BM'
-    if (len >= 26 && bytes[0] === 0x42 && bytes[1] === 0x4D) {
-        const w = i32le(18);
-        const h = Math.abs(i32le(22));
-        return w > 0 && h > 0 ? { w, h } : null;
+    // BMP: 'BM' (supports both OS/2 BITMAPCOREHEADER (12 bytes) and Windows BITMAPINFOHEADER+)
+    if (len >= 22 && bytes[0] === 0x42 && bytes[1] === 0x4D) {
+        const dibSize = u32le(14);
+        if (dibSize === 12) {
+            const w = u16le(18);
+            const h = u16le(20);
+            return w > 0 && h > 0 ? { w, h } : null;
+        }
+        if (len >= 26) {
+            const w = i32le(18);
+            const h = Math.abs(i32le(22));
+            return w > 0 && h > 0 ? { w, h } : null;
+        }
+        return null;
     }
 
-    // JPEG: FF D8 ... SOF0..SOF15 (excluding DHT C4, JPG C8, DAC CC)
+    // JPEG: FF D8 ... APP1 (EXIF Orientation) ... SOF0..SOF15 (excluding DHT C4, JPG C8, DAC CC)
     if (bytes[0] === 0xFF && bytes[1] === 0xD8) {
         let offset = 2;
+        let orientation = 1;
         while (offset + 1 < len) {
             while (offset < len && bytes[offset] !== 0xFF) offset++;
             while (offset < len && bytes[offset] === 0xFF) offset++;
@@ -310,12 +393,18 @@ export function parseImageDimensions(bytes) {
             if (offset + 2 > len) break;
             const segLen = u16be(offset);
             if (segLen < 2) break;
-            if ((marker >= 0xC0 && marker <= 0xC3) || (marker >= 0xC5 && marker <= 0xC7)
+            if (marker === 0xE1 && orientation === 1) {
+                const segEnd = Math.min(len, offset + segLen);
+                orientation = parseExifOrientation(bytes, offset + 2, segEnd);
+            } else if ((marker >= 0xC0 && marker <= 0xC3) || (marker >= 0xC5 && marker <= 0xC7)
                 || (marker >= 0xC9 && marker <= 0xCB) || (marker >= 0xCD && marker <= 0xCF)) {
                 if (offset + 7 > len) break;
                 const h = u16be(offset + 3);
                 const w = u16be(offset + 5);
-                return w > 0 && h > 0 ? { w, h } : null;
+                if (w > 0 && h > 0) {
+                    return orientation >= 5 && orientation <= 8 ? { w: h, h: w } : { w, h };
+                }
+                return null;
             }
             offset += segLen;
         }

@@ -351,7 +351,8 @@
     font-size: 0.85em;
 }
 
-#gallery .gallery-page-button.disabled {
+#gallery .gallery-page-button.disabled,
+#gallery .right_menu_button.disabled {
     opacity: 0.35;
     pointer-events: none;
 }
@@ -404,6 +405,18 @@
     grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
     gap: 8px 12px;
     margin: 6px 0;
+}
+
+.gpp-settings .gpp-settings-pair {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    margin-top: 2px;
+}
+
+.gpp-settings-section-label {
+    font-size: 0.85em;
+    font-weight: 600;
+    opacity: 0.8;
+    margin-top: 6px;
 }
 
 .gpp-field {

@@ -20,7 +20,7 @@ import { MEDIA_REQUEST_TYPE, VIDEO_EXTENSIONS } from '../../../constants.js';
 import {
     ASPECT_PRESETS, LAYOUT_DEFAULTS, LAYOUT_LIMITS, baseName, clampInt, clampPage, dominantAspect, encodePath,
     filterByName, fitTile, isVideoName, normalizeExtensions, pageCount, pageForIndex, pageSlice, parseAspect,
-    parsePageInput, sanitizeHTMLId, thumbBucket, tokenizeQuery,
+    parsePageInput, resolveGridForRatio, sanitizeHTMLId, thumbBucket, tokenizeQuery,
 } from './lib.js';
 import {
     clearLocalBackup, configureSettings, getBoolean, getFolderOverride, getLayout, getSettings, getSide, getSort,
@@ -28,8 +28,8 @@ import {
     setSide, setSort,
 } from './settings.js';
 import {
-    clearThumbnailCache, deleteThumbnailDatabase, getThumbnail, invalidateThumbnailChecks, peekDimensions,
-    peekThumbnail, prefetchPageFromDB, probeImageDimensions, purgeFolderThumbnails, purgeThumbnail,
+    clearThumbnailCache, configureThumbs, deleteThumbnailDatabase, getThumbnail, invalidateThumbnailChecks,
+    peekDimensions, peekThumbnail, prefetchPageFromDB, probeImageDimensions, purgeFolderThumbnails, purgeThumbnail,
     revalidateThumbnail,
 } from './thumbs.js';
 
@@ -41,6 +41,10 @@ const GRID_PADDING = 6;
 const DEFAULT_TILE_SIDE = 300; // only used to size thumbnails before the first fit has run
 const REVEAL_TIMEOUT_MS = 900; // longest a new gallery window waits (hidden) for its final shape
 const ASPECT_HINTS_KEY = 'gpp_aspect_hints'; // folder -> detected tile ratio, so reopening is instant
+const ASPECT_HINTS_LIMIT = 200;
+const ASPECT_CACHE_LIMIT = 200;
+const SANITIZED_CACHE_LIMIT = 500;
+const UPLOAD_CONCURRENCY = 3;
 const DEFAULT_RATIO = 2 / 3; // used until a gallery's dominant shape is known
 const ASPECT_SAMPLES = 12; // pictures sampled to find a gallery's dominant shape
 const MOBILE_BREAKPOINT = 1000;
@@ -68,6 +72,17 @@ function h(tag, attrs = {}, ...children) {
         else if (key.startsWith('on') && typeof value === 'function') el.addEventListener(key.slice(2).toLowerCase(), value);
         else if (key === 'value' || key === 'checked' || key === 'disabled' || key === 'readOnly') el[key] = value;
         else el.setAttribute(key, value === true ? '' : String(value));
+    }
+    if (attrs?.role === 'button' && tag !== 'button') {
+        if (!el.hasAttribute('tabindex')) el.setAttribute('tabindex', '0');
+        if (!el.classList.contains('gpp-tile')) {
+            el.addEventListener('keydown', (e) => {
+                if (e.key !== 'Enter' && e.key !== ' ') return;
+                if (el.classList.contains('disabled')) return;
+                e.preventDefault();
+                el.click();
+            });
+        }
     }
     for (const child of children.flat()) {
         if (child === undefined || child === null || child === false) continue;
@@ -178,6 +193,21 @@ const view = {
 };
 
 let initialized = false;
+/** @type {string|null} */
+let activeUserScope = null;
+/** @type {AbortController|null} */
+let initCtl = null;
+/** @type {ResizeObserver|null} */
+let sheldObserver = null;
+/** @type {((...args: any[]) => void) & {cancel: () => void} | null} */
+let refitDebounced = null;
+/** @type {Array<[string, Function]>} */
+let eventHandlers = [];
+/** @type {Promise<void>|null} */
+let openingPromise = null;
+let idlePrefetchHandle = 0;
+let idlePrefetchIsIdle = false;
+const inFlightDeletes = new Set();
 let foldersCache = { time: 0, list: /** @type {string[]|null} */ (null) };
 /** @type {Promise<string[]>|null} */
 let foldersInFlight = null;
@@ -188,8 +218,18 @@ let lastViewportSig = '';
 
 async function sanitizeFolder(name) {
     const key = String(name);
-    if (!sanitizedCache.has(key)) sanitizedCache.set(key, await getSanitizedFilename(key));
-    return sanitizedCache.get(key);
+    if (sanitizedCache.has(key)) {
+        const val = sanitizedCache.get(key);
+        sanitizedCache.delete(key);
+        sanitizedCache.set(key, val);
+        return val;
+    }
+    const sanitized = await getSanitizedFilename(key);
+    sanitizedCache.set(key, sanitized);
+    while (sanitizedCache.size > SANITIZED_CACHE_LIMIT) {
+        sanitizedCache.delete(sanitizedCache.keys().next().value);
+    }
+    return sanitized;
 }
 
 /** @returns {{kind: 'char'|'group', folder: string, character: any}|null} */
@@ -296,7 +336,7 @@ async function loadFolder({ keepPage = false, previousPaths = null, revalidate =
         if (previousPaths) {
             // After an upload, show the page holding the first new file.
             const index = view.filtered.findIndex(item => !previousPaths.has(item.path));
-            if (index >= 0) view.page = pageForIndex(index, view.pageSize);
+            if (index >= 0) view.page = pageForIndex(index, currentLayout().pageSize);
         } else if (!keepPage) {
             view.page = 1;
         }
@@ -335,10 +375,25 @@ async function loadFolder({ keepPage = false, previousPaths = null, revalidate =
 
 function currentLayout() {
     const layout = getLayout();
-    return { ...layout, pageSize: layout.rows * layout.cols };
+    const { rows, cols, orientation } = resolveGridForRatio(layout, activeRatio());
+    return { ...layout, rows, cols, orientation, pageSize: rows * cols };
 }
 
 const aspectCache = new Map(); // `${folder}|${count}` -> detected ratio
+
+function setAspectCache(key, ratio) {
+    aspectCache.delete(key);
+    aspectCache.set(key, ratio);
+    while (aspectCache.size > ASPECT_CACHE_LIMIT) {
+        aspectCache.delete(aspectCache.keys().next().value);
+    }
+}
+
+function getAspectHintsKey() {
+    const scope = typeof activeUserScope === 'string' ? activeUserScope.trim() : '';
+    if (scope && scope !== 'default-user') return `${ASPECT_HINTS_KEY}.${scope}`;
+    return ASPECT_HINTS_KEY;
+}
 
 /** Thumbnail resolution that matches the tiles actually on screen. */
 function currentBucket() {
@@ -350,15 +405,26 @@ function currentBucket() {
 }
 
 function readAspectHints() {
-    try { return JSON.parse(window.localStorage.getItem(ASPECT_HINTS_KEY) ?? '{}') ?? {}; } catch { return {}; }
+    try {
+        const parsed = JSON.parse(window.localStorage.getItem(getAspectHintsKey()) ?? '{}');
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+        return {};
+    }
 }
 
 function saveAspectHint(folder, ratio) {
     try {
         const hints = readAspectHints();
-        if (hints[folder] === ratio) return;
+        const keys = Object.keys(hints);
+        if (hints[folder] === ratio && keys[keys.length - 1] === folder && keys.length <= ASPECT_HINTS_LIMIT) return;
+        delete hints[folder];
         hints[folder] = ratio;
-        window.localStorage.setItem(ASPECT_HINTS_KEY, JSON.stringify(hints));
+        const allKeys = Object.keys(hints);
+        if (allKeys.length > ASPECT_HINTS_LIMIT) {
+            for (const oldKey of allKeys.slice(0, allKeys.length - ASPECT_HINTS_LIMIT)) delete hints[oldKey];
+        }
+        window.localStorage.setItem(getAspectHintsKey(), JSON.stringify(hints));
     } catch { /* storage unavailable: the hint is only an optimisation */ }
 }
 
@@ -367,7 +433,7 @@ function deleteAspectHint(folder) {
         const hints = readAspectHints();
         if (!(folder in hints)) return;
         delete hints[folder];
-        window.localStorage.setItem(ASPECT_HINTS_KEY, JSON.stringify(hints));
+        window.localStorage.setItem(getAspectHintsKey(), JSON.stringify(hints));
     } catch { /* ignore */ }
 }
 
@@ -403,10 +469,15 @@ function pickAspectSamples(images) {
         if (!seen.has(item.url)) { seen.add(item.url); picked.push(item); }
     }
     if (picked.length < ASPECT_SAMPLES) {
-        const step = Math.max(1, images.length / ASPECT_SAMPLES);
-        for (let i = 0; i < images.length && picked.length < ASPECT_SAMPLES; i++) {
-            const item = images[Math.min(images.length - 1, Math.floor(i * step))];
-            if (!seen.has(item.url)) { seen.add(item.url); picked.push(item); }
+        const remaining = images.filter(item => !seen.has(item.url));
+        const needed = ASPECT_SAMPLES - picked.length;
+        if (remaining.length <= needed) {
+            picked.push(...remaining);
+        } else {
+            const step = remaining.length / needed;
+            for (let i = 0; i < needed; i++) {
+                picked.push(remaining[Math.min(remaining.length - 1, Math.floor(i * step))]);
+            }
         }
     }
     return picked;
@@ -424,7 +495,7 @@ async function detectAspect(signal) {
     const key = `${view.folder}|${view.items.length}`;
     const cached = aspectCache.get(key);
     if (cached) {
-        if (view.autoRatio !== cached) { view.autoRatio = cached; fitPanel(true); }
+        applyDetectedAspect(cached);
         return;
     }
     const images = view.items.filter(i => !i.video);
@@ -463,16 +534,31 @@ async function detectAspect(signal) {
     const value = dominantAspect(ratios);
     const preset = ASPECT_PRESETS.find(p => p.value === value);
     if (!preset) return;
-    aspectCache.set(key, preset.ratio);
+    setAspectCache(key, preset.ratio);
     saveAspectHint(view.folder, preset.ratio);
-    if (getLayout().aspect === 'auto' && view.autoRatio !== preset.ratio) {
-        view.autoRatio = preset.ratio;
+    if (getLayout().aspect === 'auto') {
+        applyDetectedAspect(preset.ratio);
+    }
+}
+
+/** Updates autoRatio and re-renders if the orientation switch changed the active rows/columns. */
+function applyDetectedAspect(ratio) {
+    if (view.autoRatio === ratio) return;
+    const prev = currentLayout();
+    view.autoRatio = ratio;
+    const next = currentLayout();
+    if (next.rows !== prev.rows || next.cols !== prev.cols) {
+        const firstVisible = (view.page - 1) * view.pageSize;
+        view.page = pageForIndex(firstVisible, next.pageSize);
+        view.lastFitKey = '';
+        renderPage({ refit: true });
+    } else {
         fitPanel(true);
     }
 }
 
 function applyLayoutVariables() {
-    const { cols, rows } = getLayout();
+    const { cols, rows } = currentLayout();
     const ratio = activeRatio();
     // Before the first fit: a placeholder tile of the right shape.
     const tw = view.fit?.tw ?? Math.round(DEFAULT_TILE_SIDE * Math.min(1, ratio));
@@ -494,7 +580,39 @@ function applyLayoutVariables() {
     view.refs.grid.classList.toggle('gpp-show-names', getBoolean('showNames'));
 }
 
+function cancelIdlePrefetch() {
+    if (!idlePrefetchHandle) return;
+    if (idlePrefetchIsIdle && typeof cancelIdleCallback === 'function') cancelIdleCallback(idlePrefetchHandle);
+    else clearTimeout(idlePrefetchHandle);
+    idlePrefetchHandle = 0;
+    idlePrefetchIsIdle = false;
+}
+
+function scheduleNextPagePrefetch(bucket, signal) {
+    cancelIdlePrefetch();
+    const pages = pageCount(view.filtered.length, view.pageSize);
+    if (view.page >= pages || signal.aborted) return;
+    const nextItems = pageSlice(view.filtered, view.page + 1, view.pageSize);
+    const urls = nextItems.filter(item => !peekThumbnail(item.url, bucket)).map(item => item.url);
+    if (urls.length === 0) return;
+
+    const run = () => {
+        idlePrefetchHandle = 0;
+        idlePrefetchIsIdle = false;
+        if (signal.aborted || !view.panel) return;
+        void prefetchPageFromDB(urls, bucket);
+    };
+    if (typeof requestIdleCallback === 'function') {
+        idlePrefetchIsIdle = true;
+        idlePrefetchHandle = requestIdleCallback(run, { timeout: 1000 });
+    } else {
+        idlePrefetchIsIdle = false;
+        idlePrefetchHandle = setTimeout(run, 120);
+    }
+}
+
 function disposeTiles() {
+    cancelIdlePrefetch();
     view.renderCtl?.abort();
     view.renderCtl = null;
     view.observer?.disconnect();
@@ -527,12 +645,12 @@ function renderPage({ refit = false } = {}) {
         showMessage('fa-solid fa-spinner fa-spin', t`Loading…`);
     } else if (view.status === 'error') {
         showMessage('fa-solid fa-triangle-exclamation', t`Could not load this gallery.`,
-            h('div', { class: 'menu_button menu_button_icon interactable', onClick: () => loadFolder({ revalidate: true }) }, icon('fa-solid fa-rotate'), h('span', {}, t`Retry`)));
+            h('div', { class: 'menu_button menu_button_icon interactable', role: 'button', onClick: () => loadFolder({ revalidate: true }) }, icon('fa-solid fa-rotate'), h('span', {}, t`Retry`)));
     } else if (view.items.length === 0) {
         showMessage('fa-regular fa-images', t`This gallery is empty. Drop images here or press “Add Image”.`);
     } else if (view.filtered.length === 0) {
-        showMessage('fa-solid fa-magnifying-glass', `${t`No images match`} “${view.query}”.`,
-            h('div', { class: 'menu_button menu_button_icon interactable', onClick: () => setQuery('') }, icon('fa-solid fa-xmark'), h('span', {}, t`Clear search`)));
+        showMessage('fa-solid fa-magnifying-glass', t`No images match “${view.query}”.`,
+            h('div', { class: 'menu_button menu_button_icon interactable', role: 'button', onClick: () => setQuery('') }, icon('fa-solid fa-xmark'), h('span', {}, t`Clear search`)));
     } else {
         const ctl = (view.renderCtl = new AbortController());
         const bucket = currentBucket();
@@ -569,6 +687,8 @@ function renderPage({ refit = false } = {}) {
 
         if (dbMisses.length > 0 || toRevalidate.length > 0) {
             void populatePendingTiles(dbMisses, toRevalidate, bucket, ctl.signal);
+        } else {
+            scheduleNextPagePrefetch(bucket, ctl.signal);
         }
     }
 
@@ -631,6 +751,7 @@ async function populatePendingTiles(dbMisses, toRevalidate, bucket, signal) {
         for (const tile of toGenerate) startGenerate(tile);
         for (const tile of toRevalidate) startRevalidate(tile);
     }
+    scheduleNextPagePrefetch(bucket, signal);
 }
 
 /** @param {Tile} tile @param {string} url @param {Blob} blob */
@@ -671,7 +792,7 @@ function updatePager(pages) {
     if (!view.panel) return;
     const { pageInput, pageTotal, first, prev, next, last, info } = view.refs;
     pageInput.value = String(view.page);
-    pageInput.setAttribute('aria-label', `${t`Page`} (1–${pages})`);
+    pageInput.setAttribute('aria-label', t`Page (1–${pages})`);
     pageInput.style.width = `${Math.max(3, String(pages).length + 2)}ch`;
     pageTotal.textContent = `/ ${pages}`;
     first.classList.toggle('disabled', view.page <= 1);
@@ -685,9 +806,19 @@ function updatePager(pages) {
     } else {
         const from = (view.page - 1) * view.pageSize + 1;
         const to = Math.min(total, view.page * view.pageSize);
-        const range = total === 0 ? '0' : (pages > 1 ? `${from}–${to} ${t`of`} ${total}` : String(total));
-        const filtered = view.query && total !== view.items.length ? ` (${t`filtered from`} ${view.items.length})` : '';
-        info.textContent = `${range} ${total === 1 ? t`item` : t`items`}${filtered}`;
+        const isFiltered = Boolean(view.query) && total !== view.items.length;
+        const allCount = view.items.length;
+        if (total === 0) {
+            info.textContent = isFiltered ? t`0 items (filtered from ${allCount})` : t`0 items`;
+        } else if (pages > 1) {
+            info.textContent = isFiltered
+                ? t`${from}–${to} of ${total} items (filtered from ${allCount})`
+                : t`${from}–${to} of ${total} items`;
+        } else if (total === 1) {
+            info.textContent = isFiltered ? t`1 item (filtered from ${allCount})` : t`1 item`;
+        } else {
+            info.textContent = isFiltered ? t`${total} items (filtered from ${allCount})` : t`${total} items`;
+        }
     }
 }
 
@@ -778,23 +909,35 @@ function placeInBounds(element, side, bounds, width, anchorBottom = false) {
     element.style.margin = 'unset';
 }
 
-/** Height of everything in the window except the picture grid (toolbars, pager, title, padding, gaps). */
-function measureChrome(panel, padY, gap) {
-    let chrome = padY;
-    let count = 0;
+/** Collects visible in-flow chrome elements once so multi-pass fitting avoids repeated getComputedStyle() calls. */
+function collectChromeLayout(panel) {
+    /** @type {HTMLElement[]} */
+    const chromeChildren = [];
+    let flowCount = 0;
     for (const child of panel.children) {
         if (!(child instanceof HTMLElement) || child.hidden) continue;
         const ccs = getComputedStyle(child);
         if (ccs.display === 'none' || ccs.position === 'absolute' || ccs.position === 'fixed') continue;
-        count++;
-        if (child !== view.refs.scroller) chrome += child.offsetHeight;
+        flowCount++;
+        if (child !== view.refs.scroller) chromeChildren.push(child);
     }
-    return chrome + gap * Math.max(0, count - 1);
+    return { chromeChildren, flowCount };
+}
+
+function measureChromeFrom(chromeLayout, padY, gap) {
+    let chrome = padY;
+    for (const child of chromeLayout.chromeChildren) chrome += child.offsetHeight;
+    return chrome + gap * Math.max(0, chromeLayout.flowCount - 1);
+}
+
+/** Height of everything in the window except the picture grid (toolbars, pager, title, padding, gaps). */
+function measureChrome(panel, padY, gap) {
+    return measureChromeFrom(collectChromeLayout(panel), padY, gap);
 }
 
 function computeFitKey(pages) {
     const mobile = isMobileLayout();
-    const { cols, rows } = getLayout();
+    const { cols, rows } = currentLayout();
     const ratio = activeRatio();
     const pageDigits = String(pages ?? pageCount(view.filtered.length, view.pageSize)).length;
     if (mobile) {
@@ -830,7 +973,7 @@ function fitPanel(force = false) {
     const side = panel.dataset.gppSide === 'left' || panel.dataset.gppSide === 'right' ? panel.dataset.gppSide : getSide();
     panel.dataset.gppSide = side;
     const bounds = getBounds(side, true);
-    const { cols, rows } = getLayout();
+    const { cols, rows } = currentLayout();
     const ratio = activeRatio();
     const cs = getComputedStyle(panel);
     const px = (v) => parseFloat(v) || 0;
@@ -847,21 +990,28 @@ function fitPanel(force = false) {
     panel.style.maxWidth = `${bounds.width}px`;
 
     // The toolbar wraps differently at different widths, which changes the height left for the grid
-    // and with it the tile size and the width again. Iterate until settled, always keeping `tile`
-    // in sync with the final `width`.
+    // and with it the tile size and the width again. Cache non-changing child visibility outside
+    // the loop and break early once toolbar height and width settle.
+    const chromeLayout = collectChromeLayout(panel);
     let width = bounds.width;
     let tile = { tw: 24, th: 24 };
+    let prevChrome = -1;
     for (let pass = 0; pass < 5; pass++) {
         panel.style.width = `${width}px`;
-        const chrome = measureChrome(panel, padY, gap);
+        const chrome = measureChromeFrom(chromeLayout, padY, gap);
         tile = fitTile(width - padX - gridX - 1, bounds.height - chrome - gridY, cols, rows, ratio);
         const wanted = Math.ceil(cols * tile.tw + gridX + padX + 1);
         const next = Math.min(bounds.width, Math.max(minWidth, wanted));
         if (Math.abs(next - width) < 1) break;
+        if (pass > 0 && chrome === prevChrome) {
+            width = next;
+            break;
+        }
+        prevChrome = chrome;
         width = next;
         if (pass === 4) {
             panel.style.width = `${width}px`;
-            const finalChrome = measureChrome(panel, padY, gap);
+            const finalChrome = measureChromeFrom(chromeLayout, padY, gap);
             tile = fitTile(width - padX - gridX - 1, bounds.height - finalChrome - gridY, cols, rows, ratio);
         }
     }
@@ -888,7 +1038,7 @@ function fitPanelMobile(panel) {
         clearDesktopInlineGeometry(panel);
         applySavedWindowState(panel);
     }
-    const { cols, rows } = getLayout();
+    const { cols, rows } = currentLayout();
     const ratio = activeRatio();
     const scroller = view.refs.scroller;
     const cs = getComputedStyle(panel);
@@ -902,6 +1052,10 @@ function fitPanelMobile(panel) {
     const availH = window.innerHeight - measureChrome(panel, padY, px(cs.rowGap) || 5) - gridY;
     view.fit = fitTile(availW, availH, cols, rows, ratio);
     applyLayoutVariables();
+
+    if (!view.rendering && view.renderedBucket && view.tiles.size > 0 && currentBucket() > view.renderedBucket) {
+        renderPage();
+    }
 }
 
 /** @param {HTMLElement} win @param {'left'|'right'} side */
@@ -940,10 +1094,12 @@ function fitAllWindows() {
     const imageWins = document.querySelectorAll('.galleryImageDraggable');
     if (!view.panel && imageWins.length === 0) return;
 
-    // Ignore vertical-only #sheld mutations (e.g. chat growing while streaming).
+    // Ignore vertical-only #sheld mutations (e.g. chat growing while streaming), but track #top-bar height.
     const sheld = document.getElementById('sheld');
     const r = sheld ? sheld.getBoundingClientRect() : null;
-    const sig = `${window.innerWidth}x${window.innerHeight}|${r ? `${Math.round(r.left)},${Math.round(r.right)}` : ''}`;
+    const topBar = document.getElementById('top-bar')?.getBoundingClientRect();
+    const topSig = topBar ? Math.round(topBar.bottom) : '';
+    const sig = `${window.innerWidth}x${window.innerHeight}|${r ? `${Math.round(r.left)},${Math.round(r.right)}` : ''}|${topSig}`;
     if (sig === lastViewportSig) return;
     lastViewportSig = sig;
 
@@ -961,7 +1117,13 @@ function rememberDraggedSides() {
     document.querySelectorAll('#gallery, .galleryImageDraggable').forEach((win) => {
         if (!(win instanceof HTMLElement)) return;
         const r = win.getBoundingClientRect();
-        if (r.width) win.dataset.gppSide = r.left + r.width / 2 < mid ? 'left' : 'right';
+        if (!r.width) return;
+        const side = r.left + r.width / 2 < mid ? 'left' : 'right';
+        win.dataset.gppSide = side;
+        if (win === view.panel) {
+            if (getSide() !== side) setSide(side);
+            updateSideToggle();
+        }
     });
 }
 
@@ -1027,8 +1189,7 @@ function buildPanel() {
     refs.first = pagerButton('fa-solid fa-angles-left fa-fw', t`First page`);
     refs.prev = pagerButton('fa-solid fa-chevron-left fa-fw', t`Previous gallery page`);
     refs.next = pagerButton('fa-solid fa-chevron-right fa-fw', t`Next gallery page`);
-    refs.last = pagerButton('fa-solid fa-chevron-right fa-fw', t`Last page`);
-    refs.last.replaceChildren(icon('fa-solid fa-angles-right fa-fw'));
+    refs.last = pagerButton('fa-solid fa-angles-right fa-fw', t`Last page`);
     refs.pageInput = h('input', {
         type: 'text', inputmode: 'numeric', class: 'text_pole gpp-page-input', value: '1',
         title: t`Type a page number and press Enter to jump to it`, autocomplete: 'off',
@@ -1048,7 +1209,11 @@ function buildPanel() {
 
 function updateSideToggle() {
     const { sideToggle } = view.refs;
-    const right = getSide() === 'right';
+    if (!sideToggle) return;
+    const currentSide = view.panel?.dataset.gppSide === 'left' || view.panel?.dataset.gppSide === 'right'
+        ? view.panel.dataset.gppSide
+        : getSide();
+    const right = currentSide === 'right';
     sideToggle.classList.toggle('toggled', right);
     const label = right ? t`Move gallery to the left side` : t`Move gallery to the right side`;
     sideToggle.title = label;
@@ -1095,10 +1260,19 @@ function wireFolderSuggestions(input, submit, panelSignal) {
     const onOutside = (e) => { if (e.target !== input && !list.contains(e.target)) close(); };
     const position = () => {
         const r = input.getBoundingClientRect();
+        const spaceBelow = window.innerHeight - r.bottom - 12;
+        const spaceAbove = r.top - 12;
         list.style.left = `${Math.round(r.left)}px`;
-        list.style.top = `${Math.round(r.bottom + 2)}px`;
         list.style.width = `${Math.round(r.width)}px`;
-        list.style.maxHeight = `${Math.max(120, Math.min(260, window.innerHeight - r.bottom - 12))}px`;
+        if (spaceBelow < 140 && spaceAbove > spaceBelow) {
+            list.style.top = 'auto';
+            list.style.bottom = `${Math.round(window.innerHeight - r.top + 2)}px`;
+            list.style.maxHeight = `${Math.max(80, Math.min(260, spaceAbove))}px`;
+        } else {
+            list.style.bottom = 'auto';
+            list.style.top = `${Math.round(r.bottom + 2)}px`;
+            list.style.maxHeight = `${Math.max(80, Math.min(260, spaceBelow))}px`;
+        }
     };
     const setActive = (index, scroll = false) => {
         if (active === index) return;
@@ -1198,9 +1372,11 @@ function wirePanel(panel, panelSignal) {
     r.sort.addEventListener('change', () => { setSort(r.sort.value); void loadFolder({ revalidate: false }); });
     updateSideToggle();
     r.sideToggle.addEventListener('click', () => {
-        setSide(getSide() === 'right' ? 'left' : 'right');
+        const current = panel.dataset.gppSide === 'left' || panel.dataset.gppSide === 'right' ? panel.dataset.gppSide : getSide();
+        const next = current === 'right' ? 'left' : 'right';
+        setSide(next);
+        panel.dataset.gppSide = next;
         updateSideToggle();
-        panel.dataset.gppSide = getSide();
         fitPanel(true);
     });
     r.addButton.addEventListener('click', () => r.fileInput.click());
@@ -1232,13 +1408,18 @@ function wirePanel(panel, panelSignal) {
     // Drag & drop upload. Native listeners on the panel die with it (no leaked handlers).
     const hasFiles = (e) => Array.from(e.dataTransfer?.types ?? []).includes('Files');
     let depth = 0;
+    const resetDrop = () => { depth = 0; panel.classList.remove('gpp-dropping'); };
     panel.addEventListener('dragenter', (e) => { if (!hasFiles(e)) return; e.preventDefault(); e.stopPropagation(); depth++; panel.classList.add('gpp-dropping'); });
     panel.addEventListener('dragover', (e) => { if (!hasFiles(e)) return; e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = 'copy'; });
     panel.addEventListener('dragleave', (e) => { if (!hasFiles(e)) return; depth = Math.max(0, depth - 1); if (!depth) panel.classList.remove('gpp-dropping'); });
+    panel.addEventListener('dragend', resetDrop);
+    panel.addEventListener('pointerenter', () => { if (depth > 0) resetDrop(); });
+    window.addEventListener('dragend', resetDrop, { signal: panelSignal });
+    window.addEventListener('drop', resetDrop, { signal: panelSignal });
     panel.addEventListener('drop', (e) => {
         if (!hasFiles(e)) return;
         e.preventDefault(); e.stopPropagation();
-        depth = 0; panel.classList.remove('gpp-dropping');
+        resetDrop();
         const files = [...e.dataTransfer.files];
         if (files.length) void uploadFiles(files);
     });
@@ -1276,17 +1457,26 @@ function onTileActivate(event, side) {
 }
 
 async function deleteItem(item) {
-    const confirmed = await Popup.show.confirm(t`Are you sure you want to delete this image?`, item.path);
-    if (!confirmed) return;
-    const deleted = await deleteMediaFromServer(item.path, false);
-    if (!deleted) return;
-    toastr.success(t`Image deleted successfully.`);
-    void purgeThumbnail(item.url);
-    $(`.galleryImageDraggable[data-src="${CSS.escape(item.url)}"] .dragClose`).each((_, btn) => forceClose(btn));
-    // Update locally; no need to re-list the whole folder.
-    view.items = view.items.filter(i => i.path !== item.path);
-    applyFilter();
-    renderPage();
+    if (inFlightDeletes.has(item.path)) return;
+    inFlightDeletes.add(item.path);
+    const folder = view.folder;
+    try {
+        const confirmed = await Popup.show.confirm(t`Are you sure you want to delete this image?`, item.path);
+        if (!confirmed) return;
+        const deleted = await deleteMediaFromServer(item.path, false);
+        if (!deleted) return;
+        toastr.success(t`Image deleted successfully.`);
+        void purgeThumbnail(item.url);
+        $(`.galleryImageDraggable[data-src="${CSS.escape(item.url)}"] .dragClose`).each((_, btn) => forceClose(btn));
+        // Update locally only if the same folder is still open.
+        if (view.panel && view.folder === folder) {
+            view.items = view.items.filter(i => i.path !== item.path);
+            applyFilter();
+            renderPage();
+        }
+    } finally {
+        inFlightDeletes.delete(item.path);
+    }
 }
 
 async function uploadFiles(files) {
@@ -1301,16 +1491,25 @@ async function uploadFiles(files) {
     let ok = 0;
     let failed = 0;
     try {
-        for (const file of accepted) {
-            try {
-                const base64 = (await getBase64Async(file)).split(',')[1];
-                await saveBase64AsFile(base64, folder, '', getFileExtension(file));
-                ok++;
-            } catch (error) {
-                failed++;
-                console.error('[Gallery++] Upload failed:', error);
+        let nextIndex = 0;
+        const workerCount = Math.min(UPLOAD_CONCURRENCY, accepted.length);
+        const workers = Array.from({ length: workerCount }, async () => {
+            while (nextIndex < accepted.length) {
+                const file = accepted[nextIndex++];
+                try {
+                    const dataUrl = await getBase64Async(file);
+                    const comma = typeof dataUrl === 'string' ? dataUrl.indexOf(',') : -1;
+                    if (comma < 0) throw new Error('Invalid base64 data URL');
+                    const base64 = dataUrl.slice(comma + 1);
+                    await saveBase64AsFile(base64, folder, '', getFileExtension(file));
+                    ok++;
+                } catch (error) {
+                    failed++;
+                    console.error('[Gallery++] Upload failed:', error);
+                }
             }
-        }
+        });
+        await Promise.all(workers);
     } finally {
         view.uploading = false;
         if (!ok || !view.panel || view.folder !== folder) {
@@ -1319,9 +1518,9 @@ async function uploadFiles(files) {
     }
     if (ok) {
         foldersCache = { time: 0, list: null };
-        toastr.success(`${t`Uploaded`} ${ok} ${ok === 1 ? t`file` : t`files`}.`);
+        toastr.success(ok === 1 ? t`Uploaded 1 file.` : t`Uploaded ${ok} files.`);
     }
-    if (failed) toastr.error(`${t`Failed to upload`} ${failed} ${failed === 1 ? t`file` : t`files`}.`);
+    if (failed) toastr.error(failed === 1 ? t`Failed to upload 1 file.` : t`Failed to upload ${failed} files.`);
     if (ok && view.panel && view.folder === folder) {
         await loadFolder({ previousPaths: before, revalidate: false });
     }
@@ -1391,14 +1590,16 @@ async function applyFolderChoice(requested) {
         setFolderOverride(character.avatar, isDefault ? null : safe);
         const nextFolder = isDefault ? character.name : safe;
         foldersCache = { time: 0, list: null };
-        updateFolderControls();
         if (nextFolder === view.folder) {
+            updateFolderControls();
             toastr.info(t`This gallery is already showing the folder ${nextFolder}`);
             return;
         }
         resetViewForFolderSwitch(nextFolder);
         await loadFolder({ revalidate: true });
-        toastr.info(t`Gallery folder changed to ${nextFolder}`);
+        if (view.panel && view.folder === nextFolder && view.status === 'ready') {
+            toastr.info(t`Gallery folder changed to ${nextFolder}`);
+        }
     } catch (error) {
         console.error('[Gallery++] Failed to change gallery folder:', error);
         toastr.error(error?.message || t`Unknown error`, t`Failed to change gallery folder`);
@@ -1425,6 +1626,12 @@ async function restoreDefaultFolder() {
 // ------------------------------------------------------------------------------- open / close
 
 async function openGallery() {
+    if (openingPromise) return openingPromise;
+    openingPromise = openGalleryImpl().finally(() => { openingPromise = null; });
+    return openingPromise;
+}
+
+async function openGalleryImpl() {
     const target = getTarget();
     if (!target) { toastr.info(t`Select a character or group to open its gallery.`); return; }
 
@@ -1562,18 +1769,16 @@ function openMedia(item, side) {
     close.setAttribute('data-related-id', id);
 
     const media = item.video ? document.createElement('video') : document.createElement('img');
-    media.src = item.url;
     media.draggable = false;
-    if (media instanceof HTMLVideoElement) { media.controls = true; media.autoplay = true; media.loop = true; }
-    win.append(media);
-    document.getElementById('movingDivs').append(win);
-    raiseGalleryWindow(win);
-
-    if (isMobileLayout()) {
-        win.dataset.gppMode = 'mobile';
-        applySavedWindowState(win);
+    if (media instanceof HTMLVideoElement) {
+        media.controls = true;
+        media.autoplay = true;
+        media.loop = true;
+        if (getBoolean('muteVideos')) {
+            media.muted = true;
+            media.defaultMuted = true;
+        }
     }
-    win.dataset.gppSide = side;
 
     let shown = false;
     let fallbackTimer = 0;
@@ -1595,11 +1800,22 @@ function openMedia(item, side) {
     };
     media.addEventListener(media instanceof HTMLVideoElement ? 'loadedmetadata' : 'load', fit, { once: true });
     media.addEventListener('error', reveal, { once: true }); // broken file: show the (default-sized) window anyway
+    media.src = item.url;
+
+    win.append(media);
+    document.getElementById('movingDivs').append(win);
+    raiseGalleryWindow(win);
+
+    if (isMobileLayout()) {
+        win.dataset.gppMode = 'mobile';
+        applySavedWindowState(win);
+    }
+    win.dataset.gppSide = side;
     fallbackTimer = setTimeout(reveal, 3000); // safety net for a very slow server
 
     dragElement($(win));
     fitImageWindow(win, side); // provisional placement while hidden
-    if (media instanceof HTMLImageElement && media.complete) fit(); // cached (or cached-broken) picture
+    if ((media instanceof HTMLImageElement && media.complete) || (media instanceof HTMLVideoElement && media.readyState >= 1)) fit();
 }
 
 /** Closes a window through its close button on purpose (bypasses the Escape guard below). */
@@ -1657,6 +1873,14 @@ function applyPictureStyle() {
     document.body.classList.toggle('gpp-clean-pictures', getBoolean('cleanPictures'));
 }
 
+/** Mutes any currently opened gallery videos when auto-mute is enabled. */
+function applyVideoMuteSetting() {
+    if (!getBoolean('muteVideos')) return;
+    document.querySelectorAll('.galleryImageDraggable video').forEach((video) => {
+        if (video instanceof HTMLVideoElement) video.muted = true;
+    });
+}
+
 // ------------------------------------------------------------------------------- hotkeys
 
 function isTyping() {
@@ -1694,26 +1918,28 @@ function mountSettings() {
     const summary = h('small', { class: 'gpp-settings-summary' });
 
     const refreshSummary = () => {
-        const l = currentLayout();
-        const shape = l.aspect === 'auto' ? t`shape detected per gallery` : `${l.aspect} ${t`shape`}`;
-        summary.textContent = `${l.pageSize} ${t`images per page`} (${l.cols} ${t`columns`} × ${l.rows} ${t`rows`}), ${shape}. ${t`Pictures are sized to fit beside the chat.`}`;
+        const l = getLayout();
+        const pSize = l.portraitRows * l.portraitCols;
+        const lSize = l.landscapeRows * l.landscapeCols;
+        const shape = l.aspect === 'auto' ? t`shape detected per gallery` : t`${l.aspect} shape`;
+        summary.textContent = t`Portrait: ${pSize}/page (${l.portraitCols}×${l.portraitRows}) · Landscape: ${lSize}/page (${l.landscapeCols}×${l.landscapeRows}), ${shape}. Pictures are sized to fit beside the chat.`;
     };
 
-    const applyField = debounce((key) => {
-        const { min, max } = LAYOUT_LIMITS[key];
-        if (inputs[key].value.trim() === '') return; // still typing
-        const value = clampInt(inputs[key].value, min, max, LAYOUT_DEFAULTS[key]);
-        setLayout({ [key]: value });
-        refreshSummary();
-        applyLayoutToOpenGallery();
-    }, 250);
-
+    const fieldDebouncers = [];
     const numberField = (key, label, unit) => {
         const { min, max } = LAYOUT_LIMITS[key];
+        const applyOne = debounce(() => {
+            if (inputs[key].value.trim() === '') return; // still typing
+            const value = clampInt(inputs[key].value, min, max, LAYOUT_DEFAULTS[key]);
+            setLayout({ [key]: value });
+            refreshSummary();
+            applyLayoutToOpenGallery();
+        }, 250);
+        fieldDebouncers.push(applyOne);
         inputs[key] = h('input', { type: 'number', class: 'text_pole gpp-number', min, max, step: 1, value: String(getLayout()[key]), 'aria-label': label });
-        inputs[key].addEventListener('input', () => applyField(key));
+        inputs[key].addEventListener('input', applyOne);
         inputs[key].addEventListener('change', () => {
-            applyField.cancel();
+            applyOne.cancel();
             const normalized = clampInt(inputs[key].value, min, max, LAYOUT_DEFAULTS[key]);
             inputs[key].value = String(normalized); // show the corrected value
             setLayout({ [key]: normalized });
@@ -1745,12 +1971,14 @@ function mountSettings() {
             setBoolean(key, input.checked);
             if (key === 'showNames' && view.panel) view.refs.grid.classList.toggle('gpp-show-names', input.checked);
             if (key === 'cleanPictures') applyPictureStyle();
+            if (key === 'muteVideos') applyVideoMuteSetting();
         });
         return h('label', { class: 'checkbox_label' }, input, h('span', {}, label));
     };
 
     const resetButton = h('div', { class: 'menu_button menu_button_icon interactable', role: 'button' }, icon('fa-solid fa-rotate-left'), h('span', {}, t`Reset layout`));
     resetButton.addEventListener('click', () => {
+        for (const fn of fieldDebouncers) fn.cancel();
         const layout = resetLayout();
         for (const key of Object.keys(layout)) inputs[key].value = String(layout[key]);
         refreshSummary();
@@ -1760,20 +1988,27 @@ function mountSettings() {
     clearButton.addEventListener('click', async () => {
         view.renderCtl?.abort();
         const removed = await clearThumbnailCache();
-        toastr.success(`${t`Thumbnail cache cleared`} (${removed})`);
+        toastr.success(t`Thumbnail cache cleared (${removed})`);
         if (view.panel) renderPage();
     });
     const openButton = h('div', { class: 'menu_button menu_button_icon interactable', role: 'button' }, icon('fa-solid fa-sd-card'), h('span', {}, t`Open gallery`));
     openButton.addEventListener('click', () => void openGallery());
 
     const content = h('div', { class: 'inline-drawer-content' },
+        h('div', { class: 'gpp-settings-section-label' }, t`Portrait grid`),
+        h('div', { class: 'gpp-settings-grid gpp-settings-pair' },
+            numberField('portraitRows', t`Rows per page`),
+            numberField('portraitCols', t`Columns per page`)),
+        h('div', { class: 'gpp-settings-section-label' }, t`Landscape grid`),
+        h('div', { class: 'gpp-settings-grid gpp-settings-pair' },
+            numberField('landscapeRows', t`Rows per page`),
+            numberField('landscapeCols', t`Columns per page`)),
         h('div', { class: 'gpp-settings-grid' },
-            numberField('rows', t`Rows per page`),
-            numberField('cols', t`Columns per page`),
             aspectField()),
         summary,
         checkbox('showNames', t`Always show file names on pictures`),
         checkbox('cleanPictures', t`Clean opened pictures: window frame and close button only show on hover (better for transparent images)`),
+        checkbox('muteVideos', t`Automatically mute videos`),
         checkbox('escKeepsOpen', t`Esc never closes opened pictures or the gallery`),
         checkbox('hotkeys', t`Keyboard shortcuts:  [  ]  page ·  \\  toggle ·  =  close pictures`),
         h('div', { class: 'flex-container gpp-settings-buttons' }, openButton, resetButton, clearButton));
@@ -1818,7 +2053,7 @@ async function listGalleryCommand(args) {
             const character = ctx.characters?.find(c => c.name === args.char);
             folder = character ? resolveCharacterFolder(character) : args.char;
         } else if (args.group) {
-            folder = ctx.groups?.find(g => g.name == args.group)?.id;
+            folder = ctx.groups?.find(g => g.name === args.group || String(g.id) === String(args.group))?.id;
         } else {
             folder = getTarget()?.folder;
         }
@@ -1864,6 +2099,7 @@ export async function init() {
     initialized = true;
 
     const userScope = await detectUserScope();
+    activeUserScope = userScope;
     configureSettings({
         getRoot: () => SillyTavern.getContext().extensionSettings,
         saveDebounced: () => SillyTavern.getContext().saveSettingsDebounced(),
@@ -1871,12 +2107,17 @@ export async function init() {
         storage: (() => { try { return window.localStorage; } catch { return null; } })(),
         userScope,
     });
+    configureThumbs({ userScope });
     getSettings(); // validates, migrates from the original Gallery, and restores folder assignments
+
+    initCtl?.abort();
+    initCtl = new AbortController();
+    const { signal } = initCtl;
 
     const movingDivs = document.getElementById('movingDivs');
 
     // Closing windows. ST has no global handler for generic draggables.
-    $('#movingDivs').on('click', '.gpp-panel .dragClose, .galleryImageDraggable .dragClose', function (event) {
+    $('#movingDivs').off('.gpp').on('click.gpp', '.gpp-panel .dragClose, .galleryImageDraggable .dragClose', function (event) {
         if (shouldBlockClose(event)) {
             event.preventDefault();
             event.stopImmediatePropagation();
@@ -1905,35 +2146,71 @@ export async function init() {
         draggingGalleryWindow = false;
         setTimeout(rememberDraggedSides, 0);
     };
-    movingDivs?.addEventListener('pointerdown', onMovingPointerDown, { passive: true });
-    document.addEventListener('pointerup', onDragEnd, { passive: true });
-    document.addEventListener('pointercancel', onDragEnd, { passive: true });
+    movingDivs?.addEventListener('pointerdown', onMovingPointerDown, { passive: true, signal });
+    document.addEventListener('pointerup', onDragEnd, { passive: true, signal });
+    document.addEventListener('pointercancel', onDragEnd, { passive: true, signal });
 
-    document.addEventListener('keydown', onHotkey);
-    window.addEventListener('keydown', onEscapeCapture, true);
+    document.addEventListener('keydown', onHotkey, { signal });
+    window.addEventListener('keydown', onEscapeCapture, { capture: true, signal });
     applyPictureStyle();
 
     // Keep every gallery window fitted beside the chat panel when the screen or chat width changes.
-    const refit = debounce(fitAllWindows, 60);
-    window.addEventListener('resize', refit);
+    refitDebounced = debounce(fitAllWindows, 60);
+    window.addEventListener('resize', refitDebounced, { signal });
     const sheld = document.getElementById('sheld');
-    if (sheld && typeof ResizeObserver === 'function') new ResizeObserver(refit).observe(sheld);
+    if (sheld && typeof ResizeObserver === 'function') {
+        sheldObserver = new ResizeObserver(refitDebounced);
+        sheldObserver.observe(sheld);
+    }
 
-    eventSource.on(event_types.CHAT_CHANGED, () => void syncToContext());
-    eventSource.on(event_types.CHARACTER_RENAMED, (oldAvatar, newAvatar) => renameAvatar(oldAvatar, newAvatar));
-    eventSource.on(event_types.CHARACTER_DELETED, (data) => removeAvatar(data?.character?.avatar));
-    eventSource.on(event_types.CHARACTER_MANAGEMENT_DROPDOWN, (id) => { if (id === 'gpp_show_gallery_option') void openGallery(); });
+    const bindEvent = (type, fn) => {
+        eventSource.on(type, fn);
+        eventHandlers.push([type, fn]);
+    };
+    bindEvent(event_types.CHAT_CHANGED, () => void syncToContext());
+    bindEvent(event_types.CHARACTER_RENAMED, (oldAvatar, newAvatar) => renameAvatar(oldAvatar, newAvatar));
+    bindEvent(event_types.CHARACTER_DELETED, (data) => removeAvatar(data?.character?.avatar));
+    bindEvent(event_types.CHARACTER_MANAGEMENT_DROPDOWN, (id) => { if (id === 'gpp_show_gallery_option') void openGallery(); });
 
     registerCommands();
     addMenuEntries();
     mountSettings();
 }
 
-/** SillyTavern 1.17+ lifecycle hook: removes cached browser data when the extension is cleaned/uninstalled. */
+/** SillyTavern 1.17+ lifecycle hook: removes listeners, UI nodes, and cached browser data on cleanup/uninstall. */
 export async function clean() {
     closeGallery();
     closeAllImages();
+
+    initCtl?.abort();
+    initCtl = null;
+    refitDebounced?.cancel();
+    refitDebounced = null;
+    sheldObserver?.disconnect();
+    sheldObserver = null;
+    try { $('#movingDivs').off('.gpp'); } catch { /* ignore */ }
+    for (const [type, fn] of eventHandlers) {
+        if (typeof eventSource.removeListener === 'function') eventSource.removeListener(type, fn);
+        else if (typeof eventSource.off === 'function') eventSource.off(type, fn);
+    }
+    eventHandlers = [];
+
+    document.getElementById('gpp_settings')?.remove();
+    document.getElementById('gpp_show_gallery_option')?.remove();
+    document.getElementById('gpp_wand_button')?.remove();
+    document.body.classList.remove('gpp-clean-pictures');
+
+    sanitizedCache.clear();
+    aspectCache.clear();
+    inFlightDeletes.clear();
+    foldersCache = { time: 0, list: null };
+    foldersInFlight = null;
+    openingPromise = null;
+    lastViewportSig = '';
+
     clearLocalBackup();
-    try { window.localStorage.removeItem(ASPECT_HINTS_KEY); } catch { /* ignore */ }
+    try { window.localStorage.removeItem(getAspectHintsKey()); } catch { /* ignore */ }
     await deleteThumbnailDatabase();
+    activeUserScope = null;
+    initialized = false;
 }
