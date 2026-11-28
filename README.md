@@ -8,6 +8,12 @@ A ground-up rewrite of SillyTavern's Gallery extension, focused on speed, low re
 Disable the built-in **Gallery** extension so only one is active (both register `/show-gallery`).
 Your existing folder assignments, sort order and panel side are imported automatically (the old settings are left untouched).
 
+<img width="1920" height="951" alt="image" src="https://github.com/user-attachments/assets/487bf1d8-a026-4249-90d9-28a5586962cc" />
+
+<img width="1920" height="951" alt="image" src="https://github.com/user-attachments/assets/256e24e3-a072-4b94-8298-43a3bff62a1c" />
+
+<img width="1920" height="951" alt="image" src="https://github.com/user-attachments/assets/80c02ed9-b195-4dce-b4c1-712437a54804" />
+
 ## Options (Extensions tab → Gallery++)
 
 | Option | Range / Values | Default |
